@@ -3,6 +3,11 @@ name: Build CPU Image (No AVX512)
 on:
   workflow_dispatch:
     inputs:
+      ref:
+        description: 'Git ref to build (tag, branch, or commit SHA)'
+        required: false
+        default: ''
+        type: string
       push_image:
         description: 'Push image to registry'
         required: false
@@ -46,6 +51,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,9 +76,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,prefix=
-            type=raw,value=latest
-            type=raw,value=${{ inputs.target }}
+            type=raw,value=${{ steps.sha.outputs.short }}
+            type=raw,value=latest,enable=${{ inputs.ref == '' }}
+            type=raw,value=${{ inputs.ref }},enable=${{ inputs.ref != '' }}
 
       - name: Build and push CPU image (No AVX512)
         uses: docker/build-push-action@v6
