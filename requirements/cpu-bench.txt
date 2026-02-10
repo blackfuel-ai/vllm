@@ -1,0 +1,63 @@
+# Minimal dependencies for CPU benchmarking (vllm bench).
+# This is a curated subset of common.txt + cpu.txt,
+# dropping multimodal, grammar, and serving-only packages.
+
+# Core
+numpy
+tqdm
+requests >= 2.26.0
+pyyaml
+typing_extensions >= 4.10
+filelock >= 3.16.1
+cloudpickle
+pyzmq >= 25.0.0
+msgspec
+psutil
+blake3
+regex
+cachetools
+setproctitle
+py-cpuinfo
+
+# Model loading
+transformers >= 4.56.0, < 5
+tokenizers >= 0.21.1
+sentencepiece
+protobuf
+pillow
+gguf >= 0.17.0
+compressed-tensors == 0.13.0
+mistral_common >= 1.8.8
+
+# Serving (needed by engine internals)
+pydantic >= 2.12.0
+fastapi[standard] >= 0.115.0
+aiohttp
+openai >= 1.99.1
+prometheus_client >= 0.18.0
+prometheus-fastapi-instrumentator >= 7.0.0
+
+# Misc required by engine
+partial-json-parser
+einops
+depyf==0.20.0
+watchfiles
+python-json-logger
+pybase64
+cbor2
+ijson
+openai-harmony >= 0.0.3
+model-hosting-container-standards >= 0.1.10, < 1.0.0
+tiktoken >= 0.6.0
+lm-format-enforcer == 0.11.3
+diskcache == 5.6.3
+ninja
+six>=1.16.0; python_version > '3.11'
+setuptools>=77.0.3,<81.0.0; python_version > '3.11'
+
+# CPU torch (no torchaudio/torchvision)
+torch==2.9.1+cpu; platform_machine == "x86_64" or platform_machine == "s390x"
+torch==2.9.1; platform_system == "Darwin" or platform_machine == "ppc64le" or platform_machine == "aarch64"
+
+# Intel OpenMP for x86_64
+intel-openmp==2024.2.1; platform_machine == "x86_64"
