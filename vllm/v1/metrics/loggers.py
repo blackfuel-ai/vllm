@@ -885,6 +885,19 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_decode_time_request, engine_indexes, model_name
         )
 
+        histogram_upstream_request_latency = self._histogram_cls(
+            name="vllm:upstream_request_latency_seconds",
+            documentation=(
+                "Histogram of upstream request latency in seconds. "
+                "Tracks latency when vLLM acts as a client to external APIs."
+            ),
+            buckets=request_latency_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_upstream_request_latency = make_per_engine(
+            histogram_upstream_request_latency, engine_indexes, model_name
+        )
+
         histogram_prefill_kv_computed_request = self._histogram_cls(
             name="vllm:request_prefill_kv_computed_tokens",
             documentation=(
@@ -1165,6 +1178,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             if finished_request.max_tokens_param:
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
+                )
+            if finished_request.upstream_latency is not None:
+                self.histogram_upstream_request_latency[engine_idx].observe(
+                    finished_request.upstream_latency
                 )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):

@@ -228,6 +228,7 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+    upstream_latency: float | None = None
 
 
 class IterationStats:
