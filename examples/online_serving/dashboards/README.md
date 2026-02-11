@@ -70,6 +70,50 @@ percli apply -f perses/performance_statistics.yaml
 - **Data source** configured in your monitoring platform
 - **vLLM metrics** enabled and accessible
 
+## Metrics vs Logs: Best Practices
+
+All vLLM dashboards use **Prometheus metrics** exclusively rather than log-based queries.
+This is the recommended approach for production observability:
+
+### Why Metrics Over Logs
+
+| Aspect | Metrics (Prometheus) | Logs |
+|--------|---------------------|------|
+| **Performance** | Low overhead, pre-aggregated | High cardinality, expensive queries |
+| **Reliability** | Time-series optimized storage | Requires log aggregation infrastructure |
+| **Alerting** | Native PromQL support | Complex log parsing required |
+| **Cost** | Efficient storage and queries | Higher storage and query costs |
+| **Real-time** | Sub-second resolution | Depends on log shipping latency |
+
+### Available Metrics
+
+vLLM exposes comprehensive Prometheus metrics via the `/metrics` endpoint:
+
+**Latency Metrics (Histograms)**
+- `vllm:e2e_request_latency_seconds` - End-to-end request latency
+- `vllm:time_to_first_token_seconds` - Time to first token (TTFT)
+- `vllm:time_per_output_token_seconds` - Inter-token latency (TPOT)
+- `vllm:inter_token_latency_seconds` - Inter-token latency
+- `vllm:request_queue_time_seconds` - Queue waiting time
+- `vllm:request_prefill_time_seconds` - Prefill phase duration
+- `vllm:request_decode_time_seconds` - Decode phase duration
+
+**Throughput Metrics (Counters)**
+- `vllm:prompt_tokens_total` - Total prompt tokens processed
+- `vllm:generation_tokens_total` - Total tokens generated
+- `vllm:request_success_total` - Successful requests by finish reason
+
+**Resource Metrics (Gauges)**
+- `vllm:num_requests_running` - Currently running requests
+- `vllm:num_requests_waiting` - Requests waiting in queue
+- `vllm:kv_cache_usage_perc` - KV cache utilization percentage
+
+**Token Distribution (Histograms)**
+- `vllm:request_prompt_tokens` - Input prompt token counts
+- `vllm:request_generation_tokens` - Output generation token counts
+
+For the complete list of metrics, see the [Production Metrics documentation](../../../docs/usage/metrics.md).
+
 ## Platform-Specific Documentation
 
 For detailed deployment instructions and platform-specific options, see:
