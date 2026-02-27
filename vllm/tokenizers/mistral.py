@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from mistral_common.protocol.instruct.request import (
     ChatCompletionRequest as MistralChatCompletionRequest,
@@ -17,9 +17,10 @@ from mistral_common.tokens.tokenizers.sentencepiece import (
     SentencePieceTokenizer,
 )
 from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+from pydantic import ValidationError
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
-from vllm.entrypoints.openai.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.logger import init_logger
 
 from .protocol import TokenizerLike
@@ -64,14 +65,16 @@ def maybe_serialize_tool_calls(request: "MistralChatCompletionRequest"):
     # TODO: remove when pydantic v2.11 is released
     for i, message in enumerate(request.messages):
         if message.get("role") == "assistant":
-            tool_calls_validator = message.get("tool_calls", ().__iter__())
-            validated_tool_calls = []
-            while True:
+            if (tool_calls_validator := message.get("tool_calls", None)) is not None:
                 try:
-                    tool_call = next(tool_calls_validator)  # type: ignore
-                    validated_tool_calls.append(tool_call)
-                except StopIteration:
-                    break
+                    validated_tool_calls = list(tool_calls_validator)
+                except ValidationError as e:
+                    raise ValueError(
+                        "Validating messages' `tool_calls` raised an error. "
+                        "Please ensure `tool_calls` are iterable of tool calls."
+                    ) from e
+            else:
+                validated_tool_calls = []
 
             request.messages[i]["tool_calls"] = validated_tool_calls
 
@@ -207,6 +210,8 @@ def _tekken_token_to_id(tokenizer: "Tekkenizer", t: str | bytes) -> int:
 
 
 class MistralTokenizer(TokenizerLike):
+    IS_MISTRAL_TOKENIZER = True  # used by vllm.utils.mistral
+
     @classmethod
     def from_pretrained(
         cls,
@@ -272,6 +277,7 @@ class MistralTokenizer(TokenizerLike):
         # Vocab sorted by token id.
         self._vocab = self.tokenizer.vocab()
         self._max_token_id = self.vocab_size - 1
+        self._max_chars_per_token = max(len(tok) for tok in self._vocab)
 
         # Cache special tokens for faster access.
         self._special_token_ids = self._get_special_token_ids()
@@ -324,6 +330,10 @@ class MistralTokenizer(TokenizerLike):
     @property
     def max_token_id(self) -> int:
         return self._max_token_id
+
+    @property
+    def max_chars_per_token(self) -> int:
+        return self._max_chars_per_token
 
     @property
     def truncation_side(self) -> str:
@@ -441,6 +451,15 @@ class MistralTokenizer(TokenizerLike):
             ids, skip_special_tokens=skip_special_tokens
         )
 
+    @overload
+    def convert_tokens_to_ids(self, tokens: str) -> int: ...
+
+    @overload
+    def convert_tokens_to_ids(self, tokens: list[str]) -> list[int]: ...
+
+    def convert_tokens_to_ids(self, tokens: str | list[str]) -> int | list[int]:
+        return self.transformers_tokenizer.convert_tokens_to_ids(tokens)
+
     def convert_tokens_to_string(self, tokens: list[str]) -> str:
         to_decode_special_tokens = {SpecialTokens.tool_calls}
         if self.is_tekken:
@@ -500,7 +519,7 @@ class MistralTokenizer(TokenizerLike):
             return [self.tokenizer.id_to_piece(token_id) for token_id in ids]
 
         non_skip_special_tokens_ids = {
-            self.tokenizer.get_control_token(SpecialTokens.tool_calls),
+            self.tokenizer.get_special_token(SpecialTokens.tool_calls),
         }
         if isinstance(self.instruct, InstructTokenizerV13):
             if self.instruct.BEGIN_THINK:

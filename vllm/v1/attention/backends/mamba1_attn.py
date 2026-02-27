@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 
-from vllm.attention.backends.abstract import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mamba_attn import (
     BaseMambaAttentionMetadata,
     BaseMambaAttentionMetadataBuilder,
@@ -11,6 +11,10 @@ from vllm.v1.attention.backends.mamba_attn import (
 
 
 class Mamba1AttentionBackend(AttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "MAMBA1_ATTN"
+
     @staticmethod
     def get_builder_cls() -> type["Mamba1AttentionMetadataBuilder"]:
         return Mamba1AttentionMetadataBuilder
@@ -25,4 +29,3 @@ class Mamba1AttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[Mamba1AttentionMetadata]
 ):
     metadata_cls = Mamba1AttentionMetadata
-    supports_update_block_table: bool = False

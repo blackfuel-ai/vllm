@@ -103,12 +103,12 @@ try:
             output = self.worker.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
-            if isinstance(output, IntermediateTensors):
+            if self._is_intermediate_tensors(output):
                 return scheduler_output, grammar_output, output
 
             if isinstance(output, AsyncModelRunnerOutput):
                 output = output.get_output()
-            if not get_pp_group().is_last_rank:
+            if not self._is_last_rank():
                 # Case where there are no scheduled requests
                 # but may still be finished requests.
                 assert not output or not output.req_ids
@@ -124,6 +124,12 @@ try:
 
         def override_env_vars(self, vars: dict[str, str]):
             os.environ.update(vars)
+
+        def _is_intermediate_tensors(self, output) -> bool:
+            return isinstance(output, IntermediateTensors)
+
+        def _is_last_rank(self) -> bool:
+            return get_pp_group().is_last_rank
 
     ray_import_err = None
 

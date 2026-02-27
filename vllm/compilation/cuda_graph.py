@@ -17,6 +17,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
@@ -42,7 +43,9 @@ class CUDAGraphLogging:
         "Count",
     ]
 
-    def __init__(self, cg_mode: CUDAGraphMode, cg_capture_sizes: list[int] | None):
+    def __init__(
+        self, cg_mode: CUDAGraphMode, cg_capture_sizes: list[int] | None
+    ) -> None:
         self.reset()
         self.cg_mode = str(cg_mode)
         self.cg_capture_sizes = str(cg_capture_sizes or [])
@@ -54,10 +57,10 @@ class CUDAGraphLogging:
             "**CUDAGraph Stats:**\n\n"
         )
 
-    def reset(self):
-        self.stats = []
+    def reset(self) -> None:
+        self.stats: list[CUDAGraphStat] = []
 
-    def observe(self, cudagraph_stat: CUDAGraphStat):
+    def observe(self, cudagraph_stat: CUDAGraphStat) -> None:
         self.stats.append(cudagraph_stat)
 
     def generate_metric_table(self) -> str:
@@ -109,7 +112,7 @@ class CUDAGraphLogging:
             + "\n"
         )
 
-    def log(self, log_fn=logger.info):
+    def log(self, log_fn: Callable[..., Any] = logger.info) -> None:
         if not self.stats:
             return
         log_fn(self.generate_metric_table())
@@ -161,11 +164,11 @@ class CUDAGraphWrapper:
 
     def __init__(
         self,
-        runnable: Callable,
+        runnable: Callable[..., Any],
         vllm_config: VllmConfig,
         runtime_mode: CUDAGraphMode,
         cudagraph_options: CUDAGraphOptions | None = None,
-    ):
+    ) -> None:
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.runtime_mode = runtime_mode
@@ -189,7 +192,7 @@ class CUDAGraphWrapper:
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
 
-    def __getattr__(self, key: str):
+    def __getattr__(self, key: str) -> Any:
         # allow accessing the attributes of the runnable.
         if hasattr(self.runnable, key):
             return getattr(self.runnable, key)
@@ -198,11 +201,11 @@ class CUDAGraphWrapper:
             f"cudagraph wrapper: {self.runnable}"
         )
 
-    def unwrap(self) -> Callable:
+    def unwrap(self) -> Callable[..., Any]:
         # in case we need to access the original runnable.
         return self.runnable
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
@@ -219,6 +222,7 @@ class CUDAGraphWrapper:
             # runtime modes.
             return self.runnable(*args, **kwargs)
 
+        assert batch_descriptor is not None
         if batch_descriptor not in self.concrete_cudagraph_entries:
             # create a new entry for this batch descriptor
             self.concrete_cudagraph_entries[batch_descriptor] = CUDAGraphEntry(
@@ -262,6 +266,11 @@ class CUDAGraphWrapper:
                     set_graph_pool_id(self.graph_pool)
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
+
+                # Sync offloader's copy stream before capture.
+                # Ensure any pre-capture prefetches from offloader are complete.
+                get_offloader().sync_prev_onload()
+
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(
                     cudagraph,
@@ -270,6 +279,11 @@ class CUDAGraphWrapper:
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
+                    # Join offloader's copy stream after forward to avoid
+                    # unjoined stream error. The last layer's start_prefetch
+                    # forks copy_stream, but wait_prefetch only happens in
+                    # the next forward pass.
+                    get_offloader().join_after_forward()
                     if self.cudagraph_options.weak_ref_output:
                         # by converting it to weak ref,
                         # the original `output` will immediately be released
@@ -302,5 +316,8 @@ class CUDAGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
+        # Sync offloader before replay - ensures any external dependencies
+        # from pre-capture prefetches are satisfied.
+        get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
         return entry.output

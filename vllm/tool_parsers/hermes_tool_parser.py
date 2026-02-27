@@ -9,8 +9,10 @@ import regex as re
 from partial_json_parser.core.options import Allow
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
-from vllm.entrypoints.openai.protocol import (
+from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
+)
+from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
@@ -20,10 +22,10 @@ from vllm.entrypoints.openai.protocol import (
 )
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
-from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
+from vllm.utils.mistral import is_mistral_tokenizer
 
 logger = init_logger(__name__)
 
@@ -32,7 +34,7 @@ class Hermes2ProToolParser(ToolParser):
     def __init__(self, tokenizer: TokenizerLike):
         super().__init__(tokenizer)
 
-        if isinstance(tokenizer, MistralTokenizer):
+        if is_mistral_tokenizer(tokenizer):
             logger.error("Detected Mistral tokenizer when using a Hermes model")
             self.model_tokenizer = tokenizer.tokenizer
 
