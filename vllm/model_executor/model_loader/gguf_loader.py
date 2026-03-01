@@ -24,7 +24,10 @@ from vllm.model_executor.model_loader.weight_utils import (
     get_gguf_weight_type_map,
     gguf_quant_weights_iterator,
 )
-from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
+from vllm.transformers_utils.gguf_utils import (
+    detect_gguf_multimodal,
+    discover_gguf_shards,
+)
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 logger = init_logger(__name__)
@@ -45,19 +48,20 @@ class GGUFModelLoader(BaseModelLoader):
                 f"load format {load_config.load_format}"
             )
 
-    def _prepare_weights(self, model_config: ModelConfig):
+    def _prepare_weights(self, model_config: ModelConfig) -> list[str]:
         model_name_or_path = model_config.model
         if os.path.isfile(model_name_or_path):
-            return model_name_or_path
-        # for raw HTTPS link
+            return discover_gguf_shards(model_name_or_path)
+        # for raw HTTPS link (no shard support for raw URLs)
         if model_name_or_path.startswith(
             ("http://", "https://")
         ) and model_name_or_path.endswith(".gguf"):
-            return hf_hub_download(url=model_name_or_path)
+            return [hf_hub_download(url=model_name_or_path)]
         # repo id/filename.gguf
         if "/" in model_name_or_path and model_name_or_path.endswith(".gguf"):
             repo_id, filename = model_name_or_path.rsplit("/", 1)
-            return hf_hub_download(repo_id=repo_id, filename=filename)
+            local_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            return discover_gguf_shards(local_path)
         # repo_id:quant_type
         elif "/" in model_name_or_path and ":" in model_name_or_path:
             repo_id, quant_type = model_name_or_path.rsplit(":", 1)
@@ -275,21 +279,21 @@ class GGUFModelLoader(BaseModelLoader):
     def _get_gguf_weight_type(
         self,
         model_config: ModelConfig,
-        model_name_or_path: str,
+        model_paths: list[str],
         gguf_to_hf_name_map: dict[str, str],
     ) -> dict[str, str]:
         weight_type_map = get_gguf_weight_type_map(
-            model_name_or_path, gguf_to_hf_name_map
+            model_paths, gguf_to_hf_name_map
         )
         is_multimodal = hasattr(model_config.hf_config, "vision_config")
         if is_multimodal:
-            mmproj_file = detect_gguf_multimodal(model_name_or_path)
+            mmproj_file = detect_gguf_multimodal(model_paths[0])
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
             logger.info("Loading extra mm_proj weights from %s...", mmproj_file)
             mm_proj_weight_type_map = get_gguf_weight_type_map(
-                mmproj_file, gguf_to_hf_name_map
+                str(mmproj_file), gguf_to_hf_name_map
             )
             weight_type_map.update(mm_proj_weight_type_map)
         return weight_type_map
@@ -297,12 +301,12 @@ class GGUFModelLoader(BaseModelLoader):
     def _get_weights_iterator(
         self,
         model_config: ModelConfig,
-        model_name_or_path: str,
+        model_paths: list[str],
         gguf_to_hf_name_map: dict[str, str],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """
-        Iterate over GGUF model weights, loading from both main model file and
-        mmproj.gguf for multimodal Gemma3 models.
+        Iterate over GGUF model weights, loading from both main model file(s)
+        and mmproj.gguf for multimodal Gemma3 models.
 
         For Gemma3 multimodal GGUF models:
         - Main file (gemma-3-*.gguf): Language model weights (model.*)
@@ -316,38 +320,40 @@ class GGUFModelLoader(BaseModelLoader):
 
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
-            mmproj_file = detect_gguf_multimodal(model_name_or_path)
+            mmproj_file = detect_gguf_multimodal(model_paths[0])
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
-            yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
+            yield from gguf_quant_weights_iterator(
+                str(mmproj_file), gguf_to_hf_name_map
+            )
 
-        yield from gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        yield from gguf_quant_weights_iterator(model_paths, gguf_to_hf_name_map)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        local_model_path = self._prepare_weights(model_config)
+        model_paths = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         model.load_weights(
-            self._get_weights_iterator(model_config, local_model_path, gguf_weights_map)
+            self._get_weights_iterator(model_config, model_paths, gguf_weights_map)
         )
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig
     ) -> nn.Module:
         device_config = vllm_config.device_config
-        local_model_path = self._prepare_weights(model_config)
+        model_paths = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
         if "lm_head.weight" in get_gguf_extra_tensor_names(
-            local_model_path, gguf_weights_map
+            model_paths, gguf_weights_map
         ):
             model_config.hf_config.update({"tie_word_embeddings": True})
 
         weight_type_map = self._get_gguf_weight_type(
-            model_config, local_model_path, gguf_weights_map
+            model_config, model_paths, gguf_weights_map
         )
         # filter out unquantized modules to skip
         unquant_names = [

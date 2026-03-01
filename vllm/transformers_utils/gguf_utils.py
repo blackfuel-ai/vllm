@@ -86,6 +86,54 @@ def is_gguf(model: str | Path) -> bool:
     return is_remote_gguf(model)
 
 
+_GGUF_SHARD_PATTERN = re.compile(
+    r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$"
+)
+
+
+def discover_gguf_shards(gguf_path: str) -> list[str]:
+    """Given a GGUF path, return all shard paths if split, else [path].
+
+    Split GGUF files follow the naming convention:
+        {stem}-{NNNNN}-of-{TOTAL}.gguf
+    e.g. model-Q4_K_M-00001-of-00003.gguf
+
+    Args:
+        gguf_path: Path to a GGUF file (may be any shard or a non-split file).
+
+    Returns:
+        Sorted list of all shard paths, or [gguf_path] for non-split files.
+
+    Raises:
+        FileNotFoundError: If any expected shard is missing on disk.
+    """
+    name = Path(gguf_path).name
+    m = _GGUF_SHARD_PATTERN.match(name)
+    if m is None:
+        return [gguf_path]
+
+    stem = m.group("stem")
+    total = int(m.group("total"))
+    parent = Path(gguf_path).parent
+
+    shards: list[str] = []
+    missing: list[str] = []
+    for i in range(1, total + 1):
+        shard_name = f"{stem}-{i:05d}-of-{total:05d}.gguf"
+        shard_path = parent / shard_name
+        if not shard_path.is_file():
+            missing.append(str(shard_path))
+        shards.append(str(shard_path))
+
+    if missing:
+        raise FileNotFoundError(
+            f"Missing GGUF shard(s): {missing}. "
+            f"Expected {total} shards for '{stem}'."
+        )
+
+    return shards
+
+
 def detect_gguf_multimodal(model: str) -> Path | None:
     """Check if GGUF model has multimodal projector file.
 
