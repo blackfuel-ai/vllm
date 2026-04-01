@@ -70,6 +70,7 @@ jobs:
             type=raw,value=${{ steps.sha.outputs.short }}
             type=raw,value=latest,enable=${{ inputs.ref == '' }}
             type=raw,value=${{ inputs.ref }},enable=${{ inputs.ref != '' }}
+            type=raw,value=${{ inputs.ref }}-${{ steps.sha.outputs.short }},enable=${{ inputs.ref != '' }}
 
       - name: Build and push CPU bench image
         uses: docker/build-push-action@v6
