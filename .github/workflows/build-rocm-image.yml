@@ -17,16 +17,9 @@ on:
           - 'vllm-test'
           - 'vllm-openai'
           - 'vllm-dev'
-      # base_image hardcoded to specific nightly for reproducibility
-      vllm_repo:
-        description: 'vLLM repository URL'
-        required: false
-        default: 'https://github.com/vllm-project/vllm.git'
-        type: string
       vllm_branch:
         description: 'vLLM branch'
-        required: false
-        default: 'main'
+        required: true
         type: string
 
 concurrency:
@@ -80,7 +73,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             BASE_IMAGE=vllm/vllm-openai-rocm:base-nightly-e80e633927ab11570cc4d07a55e5420d05c7fe99
-            VLLM_REPO=${{ inputs.vllm_repo }}
+            VLLM_REPO=https://github.com/blackfuel-ai/vllm.git
             VLLM_BRANCH=${{ inputs.vllm_branch }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
