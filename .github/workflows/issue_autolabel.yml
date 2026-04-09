@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   add-labels:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Label issues based on keywords
         id: label-step
