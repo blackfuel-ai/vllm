@@ -1327,6 +1327,7 @@ class DeepseekV2ForCausalLM(
             self.quant_config is not None
             and self.quant_config.get_name() == "modelopt_fp4"
         )
+        self.is_v32 = hasattr(config, "index_topk")
 
         qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0)
