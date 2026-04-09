@@ -17,11 +17,7 @@ on:
           - 'vllm-test'
           - 'vllm-openai'
           - 'vllm-dev'
-      base_image:
-        description: 'Base image'
-        required: false
-        default: 'rocm/vllm-dev:base'
-        type: string
+      # base_image hardcoded to specific nightly for reproducibility
       vllm_repo:
         description: 'vLLM repository URL'
         required: false
@@ -83,7 +79,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BASE_IMAGE=${{ inputs.base_image }}
+            BASE_IMAGE=vllm/vllm-openai-rocm:base-nightly-e80e633927ab11570cc4d07a55e5420d05c7fe99
             VLLM_REPO=${{ inputs.vllm_repo }}
             VLLM_BRANCH=${{ inputs.vllm_branch }}
           cache-from: type=gha
