@@ -59,7 +59,7 @@ jobs:
             type=raw,value=${{ inputs.target }}
 
       - name: Build and push ROCm image
-        uses: docker/build-push-action@v6
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: docker/Dockerfile.rocm
@@ -71,5 +71,3 @@ jobs:
             BASE_IMAGE=vllm/vllm-openai-rocm:base-nightly-e80e633927ab11570cc4d07a55e5420d05c7fe99
             VLLM_REPO=https://github.com/blackfuel-ai/vllm.git
             VLLM_BRANCH=${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
