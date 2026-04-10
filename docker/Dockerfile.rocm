@@ -157,6 +157,25 @@ RUN --mount=type=cache,target=/root/.triton,id=triton-thirdparty,sharing=locked 
     && git cherry-pick 555d04f \
     && git cherry-pick dd998b6 \
     && if [ ! -f setup.py ]; then cd python; fi \
+    # Pre-fetch LLVM tarball via curl (with proper retries/timeouts) and
+    # expose it to Triton via LLVM_SYSPATH, bypassing Triton's hardcoded
+    # 300s urllib timeout against oaitriton.blob.core.windows.net which
+    # was consistently timing out on the build runners.
+    && LLVM_REV=$(head -c 8 cmake/llvm-hash.txt) \
+    && LLVM_NAME="llvm-${LLVM_REV}-ubuntu-x64" \
+    && LLVM_URL="https://oaitriton.blob.core.windows.net/public/llvm-builds/${LLVM_NAME}.tar.gz" \
+    && LLVM_DIR="/root/.triton/llvm/${LLVM_NAME}" \
+    && if [ ! -d "${LLVM_DIR}/include" ] || [ ! -d "${LLVM_DIR}/lib" ]; then \
+           echo "Pre-fetching ${LLVM_URL}" \
+           && mkdir -p /root/.triton/llvm \
+           && rm -rf "${LLVM_DIR}" \
+           && curl -fL --retry 5 --retry-delay 10 --retry-connrefused \
+                   --connect-timeout 30 --max-time 900 \
+                   -o /tmp/triton-llvm.tar.gz "${LLVM_URL}" \
+           && tar -xzf /tmp/triton-llvm.tar.gz -C /root/.triton/llvm \
+           && rm /tmp/triton-llvm.tar.gz; \
+       fi \
+    && export LLVM_SYSPATH="${LLVM_DIR}" \
     && if [ "$USE_SCCACHE" = "1" ]; then \
            export HIP_CLANG_PATH=/opt/sccache-wrappers \
            && export CMAKE_C_COMPILER_LAUNCHER=sccache \
