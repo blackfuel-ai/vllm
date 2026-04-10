@@ -240,7 +240,9 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_BRANCH="v0.1.12"
 ARG AITER_ROCM_ARCH="gfx942;gfx950"
 ARG USE_SCCACHE
-RUN git clone --recursive ${AITER_REPO} /app/aiter \
+RUN --mount=type=cache,target=/sccache,id=aiter-rocm-sccache,sharing=locked \
+    if [ -z "${SCCACHE_BUCKET}" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS; fi \
+    && git clone --recursive ${AITER_REPO} /app/aiter \
     && cd /app/aiter \
     && git checkout ${AITER_BRANCH} \
     && git submodule update --init --recursive \
