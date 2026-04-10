@@ -252,7 +252,7 @@ RUN --mount=type=cache,target=/sccache,id=aiter-rocm-sccache,sharing=locked \
            export HIP_CLANG_PATH=/opt/sccache-wrappers \
            && sccache --show-stats; \
        fi \
-    && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=/app/aiter_install \
+    && PREBUILD_KERNELS=1 GPU_ARCHS="${AITER_ROCM_ARCH}" python3 setup.py bdist_wheel --dist-dir=/app/aiter_install \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && ls /app/aiter_install/*.whl
 
