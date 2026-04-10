@@ -68,17 +68,19 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
         fi; \
     fi
 
-# Set sccache environment variables only when USE_SCCACHE=1
+# Set sccache environment variables only when USE_SCCACHE=1.
 # This prevents S3 config from leaking into images when sccache is not used.
 # Two backends are supported:
-#   - S3  (default): pass non-empty SCCACHE_BUCKET_NAME (+ region/credentials)
-#   - Local disk:    pass SCCACHE_BUCKET_NAME="" — sccache will fall back to
-#                    SCCACHE_DIR=/sccache, which is populated by a BuildKit
-#                    cache mount on the build RUN step(s).
+#   - S3:        pass USE_SCCACHE=1 with a non-empty SCCACHE_BUCKET_NAME
+#                (+ region/credentials).
+#   - Local disk: pass USE_SCCACHE=1 with SCCACHE_BUCKET_NAME="" — sccache
+#                 falls back to SCCACHE_DIR=/sccache, populated by a BuildKit
+#                 cache mount on the build RUN step(s). S3-specific env is
+#                 left unset so sccache does not try the S3 backend.
 ARG USE_SCCACHE
 ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
-ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION_NAME}}
-ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_S3_NO_CREDENTIALS}}
+ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_REGION_NAME}}}
+ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_S3_NO_CREDENTIALS}}}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ENV SCCACHE_DIR=${USE_SCCACHE:+/sccache}
 
