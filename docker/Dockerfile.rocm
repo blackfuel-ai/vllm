@@ -109,9 +109,12 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 # -----------------------
 # vLLM build stages
 FROM fetch_vllm AS build_vllm
-# Build vLLM (setup.py auto-detects sccache in PATH)
+# Build vLLM (setup.py auto-detects sccache in PATH).
+# When in local-disk sccache mode (no bucket), unset the empty S3 env vars
+# so sccache does not try to configure the S3 backend.
 RUN --mount=type=cache,target=/sccache,id=vllm-rocm-sccache,sharing=locked \
-    cd vllm \
+    if [ -z "${SCCACHE_BUCKET}" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS; fi \
+    && cd vllm \
     && python3 -m pip install -r requirements/rocm.txt \
     && python3 setup.py clean --all  \
     && python3 setup.py bdist_wheel --dist-dir=dist
@@ -308,10 +311,13 @@ RUN cd vllm \
     && python3 setup.py clean --all
 
 # Build wheel using pre-extracted version to avoid dirty state from modified requirements/rocm.txt
-# (setup.py auto-detects sccache in PATH)
+# (setup.py auto-detects sccache in PATH).
+# When in local-disk sccache mode (no bucket), unset the empty S3 env vars
+# so sccache does not try to configure the S3 backend.
 RUN --mount=type=bind,source=.git,target=vllm/.git \
     --mount=type=cache,target=/sccache,id=vllm-rocm-sccache,sharing=locked \
-    cd vllm \
+    if [ -z "${SCCACHE_BUCKET}" ]; then unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_S3_NO_CREDENTIALS; fi \
+    && cd vllm \
     && export SETUPTOOLS_SCM_PRETEND_VERSION=$(cat /tmp/vllm_version.txt) \
     && echo "Building wheel with version: ${SETUPTOOLS_SCM_PRETEND_VERSION}" \
     && python3 setup.py bdist_wheel --dist-dir=dist
