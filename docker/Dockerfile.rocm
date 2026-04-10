@@ -163,7 +163,11 @@ RUN --mount=type=cache,target=/root/.triton,id=triton-thirdparty,sharing=locked 
            && export CMAKE_CXX_COMPILER_LAUNCHER=sccache \
            && sccache --show-stats; \
        fi \
-    && python3 setup.py bdist_wheel --dist-dir=dist \
+    && for i in 1 2 3; do \
+           python3 setup.py bdist_wheel --dist-dir=dist && break; \
+           if [ "$i" = "3" ]; then echo "triton build failed after 3 attempts" && exit 1; fi; \
+           echo "triton build attempt $i failed, retrying in $((i * 15))s..."; sleep $((i * 15)); \
+       done \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && mkdir -p /app/install && cp dist/*.whl /app/install
 RUN if [ -d triton/python/triton_kernels ]; then pip install build && cd triton/python/triton_kernels \
