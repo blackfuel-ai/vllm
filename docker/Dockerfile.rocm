@@ -69,12 +69,18 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
     fi
 
 # Set sccache environment variables only when USE_SCCACHE=1
-# This prevents S3 config from leaking into images when sccache is not used
+# This prevents S3 config from leaking into images when sccache is not used.
+# Two backends are supported:
+#   - S3  (default): pass non-empty SCCACHE_BUCKET_NAME (+ region/credentials)
+#   - Local disk:    pass SCCACHE_BUCKET_NAME="" — sccache will fall back to
+#                    SCCACHE_DIR=/sccache, which is populated by a BuildKit
+#                    cache mount on the build RUN step(s).
 ARG USE_SCCACHE
 ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
 ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION_NAME}}
 ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_S3_NO_CREDENTIALS}}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
+ENV SCCACHE_DIR=${USE_SCCACHE:+/sccache}
 
 ARG COMMON_WORKDIR
 WORKDIR ${COMMON_WORKDIR}
@@ -102,7 +108,8 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 # vLLM build stages
 FROM fetch_vllm AS build_vllm
 # Build vLLM (setup.py auto-detects sccache in PATH)
-RUN cd vllm \
+RUN --mount=type=cache,target=/sccache,id=vllm-rocm-sccache,sharing=locked \
+    cd vllm \
     && python3 -m pip install -r requirements/rocm.txt \
     && python3 setup.py clean --all  \
     && python3 setup.py bdist_wheel --dist-dir=dist
@@ -301,6 +308,7 @@ RUN cd vllm \
 # Build wheel using pre-extracted version to avoid dirty state from modified requirements/rocm.txt
 # (setup.py auto-detects sccache in PATH)
 RUN --mount=type=bind,source=.git,target=vllm/.git \
+    --mount=type=cache,target=/sccache,id=vllm-rocm-sccache,sharing=locked \
     cd vllm \
     && export SETUPTOOLS_SCM_PRETEND_VERSION=$(cat /tmp/vllm_version.txt) \
     && echo "Building wheel with version: ${SETUPTOOLS_SCM_PRETEND_VERSION}" \
