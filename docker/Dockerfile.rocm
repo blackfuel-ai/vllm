@@ -100,7 +100,7 @@ ARG SCCACHE_S3_NO_CREDENTIALS
 RUN if [ "$USE_SCCACHE" = "1" ]; then \
         echo "Installing sccache..." \
         && SCCACHE_ARCH="x86_64" \
-        && SCCACHE_VERSION="v0.8.1" \
+        && SCCACHE_VERSION="v0.14.0" \
         && SCCACHE_DL_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
         && curl -L -o /tmp/sccache.tar.gz ${SCCACHE_DL_URL} \
         && tar -xzf /tmp/sccache.tar.gz -C /tmp \
@@ -437,7 +437,7 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
         else \
             echo "Installing sccache..." \
             && SCCACHE_ARCH="x86_64" \
-            && SCCACHE_VERSION="v0.8.1" \
+            && SCCACHE_VERSION="v0.14.0" \
             && SCCACHE_DL_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
             && curl -L -o /tmp/sccache.tar.gz ${SCCACHE_DL_URL} \
             && tar -xzf /tmp/sccache.tar.gz -C /tmp \
