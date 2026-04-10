@@ -71,5 +71,7 @@ jobs:
             BASE_IMAGE=vllm/vllm-openai-rocm:base-nightly-e80e633927ab11570cc4d07a55e5420d05c7fe99
             VLLM_REPO=https://github.com/blackfuel-ai/vllm.git
             VLLM_BRANCH=${{ github.ref_name }}
+            AITER_REPO=https://github.com/blackfuel-ai/aiter.git
+            AITER_BRANCH=fix/pa-mqa-logits-small-heads
             USE_SCCACHE=1
             SCCACHE_BUCKET_NAME=

@@ -230,6 +230,31 @@ RUN git clone ${DEEPEP_REPO} \
  && python3 setup.py --variant rocm --nic ${DEEPEP_NIC} bdist_wheel --dist-dir=/app/deep_install
 
 # -----------------------
+# AITER patch build stage: rebuild aiter from the blackfuel fork to pick up
+# fixes not yet rolled into the pinned BASE_IMAGE (e.g. the pa_mqa_logits
+# ChunkQ clamp needed for GLM-5.1 at TP=4, where heads-per-rank = 16 < 64).
+# The resulting wheel is force-reinstalled over the aiter baked into the
+# base image in the test/final stages below.
+FROM base AS build_aiter_patch
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_BRANCH="v0.1.12"
+ARG AITER_ROCM_ARCH="gfx942;gfx950"
+ARG USE_SCCACHE
+RUN git clone --recursive ${AITER_REPO} /app/aiter \
+    && cd /app/aiter \
+    && git checkout ${AITER_BRANCH} \
+    && git submodule update --init --recursive \
+    && pip install -r requirements.txt \
+    && pip install pyyaml \
+    && if [ "$USE_SCCACHE" = "1" ]; then \
+           export HIP_CLANG_PATH=/opt/sccache-wrappers \
+           && sccache --show-stats; \
+       fi \
+    && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=/app/aiter_install \
+    && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
+    && ls /app/aiter_install/*.whl
+
+# -----------------------
 # vLLM wheel release build stage (for building distributable wheels)
 # This stage pins dependencies to custom ROCm wheel versions and handles version detection
 FROM fetch_vllm AS build_vllm_wheel_release
@@ -354,6 +379,11 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
 # above are not available once that RUN step completes.
 COPY --from=export_vllm /*.whl /opt/vllm-wheels/
 
+# Force-reinstall patched aiter over the version baked into the base image.
+# Needed for GLM-5.1 at TP=4 (pa_mqa_logits ChunkQ clamp fix).
+RUN --mount=type=bind,from=build_aiter_patch,src=/app/aiter_install,target=/aiter_patch \
+    pip install --force-reinstall --no-deps /aiter_patch/*.whl
+
 # Install RIXL wheel
 RUN --mount=type=bind,from=build_rixl,src=/app/install,target=/rixl_install \
     uv pip install --system /rixl_install/*.whl
@@ -460,6 +490,11 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     && uv pip install --system -r requirements/rocm.txt \
     && pip uninstall -y vllm \
     && uv pip install --system *.whl
+
+# Force-reinstall patched aiter over the version baked into the base image.
+# Needed for GLM-5.1 at TP=4 (pa_mqa_logits ChunkQ clamp fix).
+RUN --mount=type=bind,from=build_aiter_patch,src=/app/aiter_install,target=/aiter_patch \
+    uv pip install --system --force-reinstall --no-deps /aiter_patch/*.whl
 
 ARG COMMON_WORKDIR
 ARG BASE_IMAGE
