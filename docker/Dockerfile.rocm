@@ -233,6 +233,13 @@ ARG PYTORCH_AUDIO_REPO
 # under the TryCompile cwd). The pytorch build is only run once per
 # base-image hash, so losing the cache here is an acceptable trade.
 
+# Remove sccache entirely from this stage. Pytorch's CMake auto-detects
+# /usr/bin/sccache from PATH and wires it in regardless of whether we
+# export CMAKE_*_COMPILER_LAUNCHER, and sccache v0.14.0 has been broken
+# here in every configuration we've tried (direct mode: File::open
+# ENOENT; classic mode: spawn ENOENT). Other stages inherit FROM sys_base
+# independently and still get the sccache binary from their own layer.
+RUN rm -f /usr/bin/sccache /opt/sccache-wrappers/clang /opt/sccache-wrappers/clang++
 RUN apt-get update && apt-get install -y pkg-config liblzma-dev
 RUN git clone ${PYTORCH_REPO} pytorch
 RUN cd pytorch && git checkout ${PYTORCH_BRANCH}
