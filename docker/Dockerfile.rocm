@@ -131,7 +131,13 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
 ARG USE_SCCACHE
 ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
 ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_REGION_NAME}}}
-ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_S3_NO_CREDENTIALS}}}
+# NOTE: must never be set to an empty string — sccache rejects empty
+# values with "SCCACHE_S3_NO_CREDENTIALS must be 'true', 'on', '1',
+# 'false', 'off' or '0'." even when no S3 bucket is configured and the
+# setting would otherwise be ignored. Default to "false" so any stage
+# that invokes sccache (including pytorch's CMake, which auto-detects
+# sccache from PATH) sees a valid value.
+ENV SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS:-false}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ENV SCCACHE_DIR=${USE_SCCACHE:+/sccache}
 
@@ -466,7 +472,13 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
 ARG USE_SCCACHE
 ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
 ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_REGION_NAME}}}
-ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_S3_NO_CREDENTIALS}}}
+# NOTE: must never be set to an empty string — sccache rejects empty
+# values with "SCCACHE_S3_NO_CREDENTIALS must be 'true', 'on', '1',
+# 'false', 'off' or '0'." even when no S3 bucket is configured and the
+# setting would otherwise be ignored. Default to "false" so any stage
+# that invokes sccache (including pytorch's CMake, which auto-detects
+# sccache from PATH) sees a valid value.
+ENV SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS:-false}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ENV SCCACHE_DIR=${USE_SCCACHE:+/sccache}
 
