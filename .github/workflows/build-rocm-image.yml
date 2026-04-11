@@ -72,5 +72,5 @@ jobs:
             VLLM_BRANCH=${{ github.ref_name }}
             AITER_REPO=https://github.com/blackfuel-ai/aiter.git
             AITER_BRANCH=fix/pa-mqa-logits-small-heads
-            USE_SCCACHE=1
+            USE_SCCACHE=0
             SCCACHE_BUCKET_NAME=
