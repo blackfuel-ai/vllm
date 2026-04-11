@@ -140,6 +140,13 @@ ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_REGION_NAME}}
 ENV SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS:-false}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ENV SCCACHE_DIR=${USE_SCCACHE:+/sccache}
+# Disable sccache "preprocessor cache" (direct) mode. sccache v0.14.0's
+# preprocessor_cache.rs::preprocessor_cache_entry_hash_key fails with
+# "while hashing the input file" / ENOENT on File::open under BuildKit
+# overlay, observed both on CMake TryCompile scratch files and on real
+# pytorch sources (e.g. gloo/algorithm.cc). Classic preprocess-then-hash
+# mode is slower but reliable. Upstream bug: mozilla/sccache#...
+ENV SCCACHE_DIRECT=false
 
 
 ###
@@ -481,6 +488,8 @@ ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME:+${SCCACHE_REGION_NAME}}
 ENV SCCACHE_S3_NO_CREDENTIALS=${SCCACHE_S3_NO_CREDENTIALS:-false}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ENV SCCACHE_DIR=${USE_SCCACHE:+/sccache}
+# See sys_base — direct mode is broken under BuildKit overlay.
+ENV SCCACHE_DIRECT=false
 
 ARG COMMON_WORKDIR
 WORKDIR ${COMMON_WORKDIR}
