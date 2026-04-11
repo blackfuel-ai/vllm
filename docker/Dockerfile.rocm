@@ -97,27 +97,16 @@ ARG SCCACHE_ENDPOINT
 ARG SCCACHE_BUCKET_NAME
 ARG SCCACHE_REGION_NAME
 ARG SCCACHE_S3_NO_CREDENTIALS
-# If a pre-built sccache binary is staged in docker/sccache-bin/sccache
-# (e.g. our patched blackfuel-ai/sccache fork with the CMake TryCompile
-# fallback — see branch blackfuel/cmake-try-compile-fallback), use it.
-# Otherwise fall back to the upstream release tarball.
-RUN --mount=type=bind,source=docker/sccache-bin,target=/tmp/sccache-bin \
-    if [ "$USE_SCCACHE" = "1" ]; then \
+RUN if [ "$USE_SCCACHE" = "1" ]; then \
         echo "Installing sccache..." \
-        && if [ -f /tmp/sccache-bin/sccache ]; then \
-               echo "Using staged sccache binary from build context" \
-               && cp /tmp/sccache-bin/sccache /usr/bin/sccache \
-               && chmod +x /usr/bin/sccache; \
-           else \
-               SCCACHE_ARCH="x86_64" \
-               && SCCACHE_VERSION="v0.14.0" \
-               && SCCACHE_DL_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
-               && curl -L -o /tmp/sccache.tar.gz ${SCCACHE_DL_URL} \
-               && tar -xzf /tmp/sccache.tar.gz -C /tmp \
-               && mv /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
-               && chmod +x /usr/bin/sccache \
-               && rm -rf /tmp/sccache.tar.gz /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl; \
-           fi \
+        && SCCACHE_ARCH="x86_64" \
+        && SCCACHE_VERSION="v0.14.0" \
+        && SCCACHE_DL_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
+        && curl -L -o /tmp/sccache.tar.gz ${SCCACHE_DL_URL} \
+        && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+        && mv /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
+        && chmod +x /usr/bin/sccache \
+        && rm -rf /tmp/sccache.tar.gz /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl \
         && sccache --version; \
     fi
 

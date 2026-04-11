@@ -40,42 +40,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: useblacksmith/setup-docker-builder@v1
 
-      - name: Download patched sccache binary
-        env:
-          # PAT with read access to blackfuel-ai/sccache actions artifacts.
-          # Falls back to GITHUB_TOKEN, which only works when the artifact
-          # lives in the same repo. Leave empty to build with upstream sccache.
-          GH_TOKEN: ${{ secrets.SCCACHE_ARTIFACT_TOKEN || secrets.GITHUB_TOKEN }}
-          SCCACHE_ARTIFACT_REPO: blackfuel-ai/sccache
-          SCCACHE_ARTIFACT_ID: "6383867000"
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN}" ]; then
-            echo "No token available — skipping patched sccache staging"
-            exit 0
-          fi
-          mkdir -p docker/sccache-bin
-          echo "Fetching sccache artifact ${SCCACHE_ARTIFACT_ID} from ${SCCACHE_ARTIFACT_REPO}..."
-          if ! gh api \
-                  -H "Accept: application/vnd.github+json" \
-                  "/repos/${SCCACHE_ARTIFACT_REPO}/actions/artifacts/${SCCACHE_ARTIFACT_ID}/zip" \
-                  > /tmp/sccache-artifact.zip; then
-            echo "Artifact fetch failed — falling back to upstream sccache"
-            rm -f /tmp/sccache-artifact.zip
-            exit 0
-          fi
-          unzip -o /tmp/sccache-artifact.zip -d docker/sccache-bin/
-          # Artifact contains a single sccache binary; normalize the name.
-          if [ ! -f docker/sccache-bin/sccache ]; then
-            extracted=$(find docker/sccache-bin -type f -name 'sccache*' | head -n1)
-            if [ -n "${extracted}" ]; then
-              mv "${extracted}" docker/sccache-bin/sccache
-            fi
-          fi
-          chmod +x docker/sccache-bin/sccache
-          ls -la docker/sccache-bin/
-          sha256sum docker/sccache-bin/sccache
-
       - name: Log in to GitHub Container Registry
         if: ${{ inputs.push_image }}
         uses: docker/login-action@v3
