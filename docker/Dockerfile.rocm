@@ -199,6 +199,7 @@ RUN cd /opt/rixl && \
     sed -i "s/--exclude 'libamdhip64\*'/--exclude 'libamdhip64*' --exclude 'libcore*' --exclude 'libpull*'/" \
         contrib/build-wheel.sh && \
     mkdir -p /app/install && \
+    _ucx_install_dir=${UCX_HOME} \
     ./contrib/build-wheel.sh \
         --output-dir /app/install \
         --rocm-dir ${ROCM_PATH} \
