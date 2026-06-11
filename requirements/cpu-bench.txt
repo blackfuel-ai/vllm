@@ -20,7 +20,8 @@ setproctitle
 py-cpuinfo
 
 # Model loading
-transformers >= 4.56.0, < 5
+# transformers 5.x parses list-format extra_special_tokens (Gemma 4 family tokenizers)
+transformers == 5.11.0
 tokenizers >= 0.21.1
 sentencepiece
 protobuf
