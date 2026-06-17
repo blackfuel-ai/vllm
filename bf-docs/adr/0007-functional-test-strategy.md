@@ -1,0 +1,42 @@
+# ADR-0007: Functional test strategy (tiered)
+
+**Status**: Accepted
+**Date**: 2026-06-17
+
+## Context
+
+Every CI gate `bf-vllm` runs today is an *infrastructure* gate. `bf-lint` checks our own discipline (ADR link validity, `.bf-paths` syntax, `bf-*.yml` shape). `bf-precommit` runs upstream's lint config. `bf-classification-lint` and `bf-patches-trailer-lint` enforce the change-classification and `[bf-patch]` rules from [ADR-0003](0003-change-classification-and-patch-discipline.md). `bf-pr-review` runs the reviewer agent ([ADR-0006](0006-agentic-workflow-boundaries.md)). Not one of them imports `vllm`, instantiates a model, or executes a kernel. A PR can break `import vllm`, a CPU kernel, the sampler, or the tokenizer and sail through every check green. We have a green-but-broken risk and no functional floor under it.
+
+This matters most at the sync seam. Per [ADR-0002](0002-two-branch-architecture.md), `bf-vllm` inherits upstream's *entire* `tests/` tree on every merge-based sync, and runs none of it. Per [ADR-0003](0003-change-classification-and-patch-discipline.md) we also carry `[bf-patch]` edits to upstream-owned files and a small set of `bf/files`. The combination — hundreds of upstream commits landing per sync, layered over our patches — is exactly the situation where a functional regression is most likely and least visible. The most valuable thing a functional gate can do is turn a sync PR red *before* merge when upstream drift breaks our patches or breaks inference, rather than discovering it after it has reached `main` or a built image.
+
+The build CI ([ADR-0005](0005-build-ci-development-velocity.md)) does compile vLLM for CPU, NVIDIA, and ROCm, which proves the code builds — but a successful compile says nothing about whether the result imports cleanly or produces correct output. The existing ADRs are silent on functional testing. This ADR records the strategy.
+
+Two hard constraints shape it. First, the full upstream `tests/` suite assumes GPUs, downloads large models, and exercises code paths (TPU, specific kernels, distributed) that `bf-vllm` does not serve. Running it wholesale is neither affordable nor relevant. Second, GPU runner time is gated by [ADR-0006](0006-agentic-workflow-boundaries.md): an agent may not spend it without an explicit budget envelope in the task prompt, and we have no standing self-hosted GPU runner yet. So the first functional gate has to be free — CPU-only, no GPU, no model download.
+
+## Decision
+
+Adopt a three-tier functional-test strategy. Tiers are introduced independently as the runner fleet and budget allow; this ADR ships Tier 0 and commits the design of the other two.
+
+**Tier 0 — CPU smoke (shipped with this ADR).** A `bf-cpu-smoke` workflow that, on every pull request, builds vLLM for CPU using the canonical `VLLM_TARGET_DEVICE=cpu` incantation mirrored from `docker/Dockerfile.cpu`, asserts that `import vllm` succeeds, and runs a curated, hand-picked slice of the inherited upstream `tests/` — pure-Python and import-level tests that need neither a GPU nor a model download. Tier 0 gates *every* PR, including `[sync]` PRs; it is deliberately not exempted the way `bf-patches-trailer-lint` exempts syncs, because the sync is precisely the change we most want a functional floor under. The trailer-lint exemption concerns commit-message discipline, which is meaningless for upstream commits; a functional smoke concerns whether the merged tree still imports and runs, which is meaningful for exactly those commits. Tier 0 is free (no GPU), runs on the same Blacksmith CPU runner class the CPU image build already uses, and targets a roughly eight-to-ten-minute wall clock with the build caches warm. It ships as a normal, non-required check; the operator promotes it to a required check on `main` after a few green runs confirm the cold-build time and the curated set are stable.
+
+**Tier 1 — GPU smoke (deferred).** A tiny-model inference check plus a golden-output diff, run on a self-hosted GPU runner, scoped to the architectures `bf-vllm` actually serves (MI300/MI325 on ROCm, the NVIDIA SKUs we deploy). It would load a small model, generate against a fixed prompt with greedy sampling, and diff the output token IDs against a checked-in golden file, catching the kernel- and sampler-correctness regressions that Tier 0 structurally cannot. It additionally runs a narrow, hand-scoped subset of upstream's own GPU tests for those architectures. Tier 1 is deferred because it requires a standing self-hosted GPU runner that does not yet exist, and because GPU runner spend falls under the [ADR-0006](0006-agentic-workflow-boundaries.md) budget-envelope rule. When the runner lands, Tier 1 gets its own ADR sizing the model, the golden-diff tolerance, and the per-PR GPU-minute budget.
+
+**Tier 2 — targeted upstream modules on demand.** For a `[bf-patch]` that touches a specific kernel or subsystem, the relevant upstream test module is run on demand — invoked per patch rather than on every PR. This is the surgical complement to the two standing tiers: when we patch attention, we run the attention tests; we do not run them on unrelated PRs. Tier 2 is a convention plus a runner target rather than a single always-on workflow, and it leans on Tier 1's GPU runner when the targeted module needs one.
+
+## Alternatives considered
+
+**Run the full upstream test suite.** Rejected. It is enormous, assumes GPUs and large model downloads, and spends most of its time on code paths — alternate backends, architectures, and kernels — that `bf-vllm` does not serve. The cost is unbounded and most of the signal is irrelevant to us. The curated Tier 0 slice plus the scoped Tier 1 and on-demand Tier 2 sets capture the signal we care about at a fraction of the cost.
+
+**Engine-level or benchmark-only validation.** Rejected as the *primary* gate. Validating only through a full engine spin-up or a `vllm bench` run catches regressions too late and too coarsely: a benchmark tells you throughput moved, not which import or kernel broke, and it runs long after the cheap import-level signal was available. Coarse end-to-end checks are useful higher up the pyramid but are the wrong floor.
+
+**No functional CI (status quo).** Rejected. This is the green-but-broken risk that motivates the ADR: discipline and lint gates that never execute the code, so a broken `import vllm` or a broken sampler merges green. Unacceptable now that syncs land hundreds of upstream commits over our patches.
+
+## Consequences
+
+Every PR, sync PRs included, now has a functional floor: it must at minimum import vLLM and pass the curated CPU-safe tests before it can be marked mergeable. That is the headline win — upstream drift that breaks our patches or breaks basic inference plumbing goes red on the sync PR instead of reaching `main`.
+
+Tier 0 cannot catch GPU-only or kernel-correctness regressions. A CPU smoke proves the Python surface imports and the CPU-reachable logic behaves; it says nothing about whether an attention kernel on MI300 produces correct numbers. That gap is owned by Tier 1 and Tier 2 and is the reason they are part of this decision rather than left implicit.
+
+The curated Tier 0 set needs ongoing maintenance, because upstream moves and renames test files and we inherit those moves on every sync. This is not hypothetical: when this ADR landed, several of the originally proposed curated paths had already been renamed or relocated upstream (a root-level sampling-params test had moved under the benchmarks tree, the tokenization directory had been renamed, and a couple of root utility-test files had been dispersed into subpackages), so the shipped set was re-verified against `main` and adjusted. The mitigation is mechanical rather than vigilant: when a sync renames or deletes a curated file, Tier 0 fails at collection on that sync PR, which is the signal to repoint the list at the moved file or drop it. The cost is a small, recurring, self-announcing maintenance task rather than silent rot. We also deliberately excluded tests that instantiate real models or fetch tokenizers over the network from the Tier 0 set, since a smoke gate must stay fast and offline; those belong to Tier 1 or Tier 2.
+
+Finally, this ADR establishes the seam between tiers so that adding Tier 1 later is an additive change with its own ADR, not a retrofit of Tier 0.
