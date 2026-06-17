@@ -111,6 +111,17 @@ jobs:
             requirements/build/cpu.txt
             requirements/common.txt
 
+      # Create a uv venv and make it the default for every later step
+      # (docker/Dockerfile.cpu does `uv venv --seed` then puts it on PATH).
+      # The runner's `/usr` Python is PEP-668 externally-managed, so a bare
+      # `uv pip install --system` is refused — install into this venv instead.
+      - name: Create build virtualenv
+        run: |
+          set -euo pipefail
+          uv venv --python "${PYTHON_VERSION}" --seed "${GITHUB_WORKSPACE}/.venv"
+          echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+
       # ccache + cargo registry caches persist the expensive compile artifacts
       # across runs. Keyed on the requirement/toolchain fingerprints so an
       # upstream torch/toolchain bump starts a fresh (correct) cache lineage.
@@ -156,17 +167,17 @@ jobs:
       - name: Build Rust frontend (vllm-rs)
         run: |
           set -euo pipefail
-          uv pip install --system -r requirements/build/rust.txt
+          uv pip install -r requirements/build/rust.txt
           bash build_rust.sh
 
       - name: CPU build + install vLLM (editable)
         run: |
           set -euo pipefail
-          uv pip install --system -r requirements/build/cpu.txt
+          uv pip install -r requirements/build/cpu.txt
           # VLLM_TARGET_DEVICE=cpu is the canonical CPU build switch
           # (docker/Dockerfile.cpu). Editable install so the curated tests
           # import the freshly built extension.
-          VLLM_TARGET_DEVICE=cpu uv pip install --system -e . --no-build-isolation
+          VLLM_TARGET_DEVICE=cpu uv pip install -e . --no-build-isolation
 
       - name: Import check
         id: import
@@ -182,8 +193,8 @@ jobs:
           # The curated tests below are import/pure-Python tests, but the root
           # tests/conftest.py is imported for any test under tests/ and pulls
           # tblib + pytest-asyncio. vllm_test_utils backs tests/utils.py.
-          uv pip install --system pytest pytest-asyncio tblib
-          uv pip install --system -e tests/vllm_test_utils
+          uv pip install pytest pytest-asyncio tblib
+          uv pip install -e tests/vllm_test_utils
 
       - name: Run curated CPU-safe tests
         id: pytest
