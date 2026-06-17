@@ -149,10 +149,14 @@ jobs:
 
       # Build the Rust frontend (`vllm-rs`) the same way Dockerfile.cpu's
       # rust-build stage does; setup.py picks up the prebuilt artifacts and
-      # skips an in-tree rebuild.
+      # skips an in-tree rebuild. build_rust.sh -> tools/build_rust.py imports
+      # setuptools_rust, so the rust build requirements must be installed first
+      # (Dockerfile.cpu installs requirements/build/rust.txt in its rust-build
+      # stage before invoking the build).
       - name: Build Rust frontend (vllm-rs)
         run: |
           set -euo pipefail
+          uv pip install --system -r requirements/build/rust.txt
           bash build_rust.sh
 
       - name: CPU build + install vLLM (editable)
