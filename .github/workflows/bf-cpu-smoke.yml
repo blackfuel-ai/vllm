@@ -201,16 +201,23 @@ jobs:
         env:
           # Force the CPU platform and eager paths; never reach for a GPU.
           VLLM_TARGET_DEVICE: cpu
-          # Curated CPU-safe set — re-verified present on main (ADR-0007).
-          # Pure-Python / import-level only: no GPU, no model download.
-          # Excluded deliberately: tests/test_regression.py (instantiates real
-          # LLM(...) models -> HF download + inference, too heavy/networked for
-          # a smoke); tokenizer tests (network-fetch a tokenizer).
+          # Curated CPU-safe set — re-verified present on main and confirmed
+          # green on this runner (90 tests pass; ADR-0007). Pure-Python /
+          # import-level only: no GPU, no model download.
+          # Excluded deliberately:
+          #   - tests/test_regression.py: instantiates real LLM(...) models ->
+          #     HF download + inference, too heavy/networked for a smoke.
+          #   - tokenizer tests: network-fetch a tokenizer.
+          #   - tests/test_version.py: asserts the version TUPLE has 3-5 fields,
+          #     but our from-source dev build produces a 6-field dev version
+          #     (e.g. 0.23.1rc1.dev196+gc8b91b1a7 -> (0,23,1,'rc1','dev196',
+          #     'g<sha>')). The test fails on ANY dev build regardless of code
+          #     health, so it is environment-sensitive noise for a smoke gate,
+          #     not a regression signal. Dropped (ADR-0007 curated-set rule).
           CURATED_TESTS: >-
             tests/test_sequence.py
             tests/test_outputs.py
             tests/test_logger.py
-            tests/test_version.py
             tests/test_envs.py
             tests/test_scalartype.py
             tests/transformers_utils/test_utils.py
@@ -235,7 +242,7 @@ jobs:
             echo "| curated CPU pytest | ${PYTEST_OUTCOME:-skipped} |"
             echo
             echo "Curated set (CPU-safe, no GPU, no model download):"
-            echo "\`test_sequence test_outputs test_logger test_version test_envs test_scalartype transformers_utils/test_utils\`"
+            echo "\`test_sequence test_outputs test_logger test_envs test_scalartype transformers_utils/test_utils\`"
             echo
             echo "Tier-0 of the ADR-0007 functional-test strategy. GPU-smoke (T1)"
             echo "and on-demand kernel-test (T2) tiers are tracked there."
