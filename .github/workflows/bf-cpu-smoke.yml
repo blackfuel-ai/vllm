@@ -15,8 +15,10 @@
 #      caches persist across runs on the Blacksmith sticky disk; a Docker build
 #      would re-import the world into a fresh image layer each PR.
 #   2. Asserts `import vllm` succeeds and prints the version.
-#   3. Runs a curated, CPU-safe slice of the inherited upstream `tests/` tree —
-#      pure-Python / import-level tests that need neither a GPU nor a model
+#   3. Runs a curated, CPU-safe slice of the inherited upstream `tests/` tree:
+#      pure-Python / import-level tests of core plumbing, PLUS compiled-CPU
+#      functional tests (attention kernel + top-k/top-p sampler) drawn from
+#      upstream's own CPU hardware-CI list. Neither needs a GPU or a model
 #      download. This is the payoff for the sync workflow (ADR-0002): upstream
 #      drift that breaks our [bf-patch]es or `bf/files` goes red on the [sync]
 #      PR BEFORE merge instead of surfacing in production.
@@ -201,9 +203,27 @@ jobs:
         env:
           # Force the CPU platform and eager paths; never reach for a GPU.
           VLLM_TARGET_DEVICE: cpu
-          # Curated CPU-safe set — re-verified present on main and confirmed
-          # green on this runner (90 tests pass; ADR-0007). Pure-Python /
-          # import-level only: no GPU, no model download.
+          # Curated CPU-safe set — re-verified present on main (ADR-0007).
+          # No GPU, no model download. Two layers:
+          #
+          # (a) Pure-Python / import-level tests of core data structures and
+          #     plumbing (confirmed green on this runner).
+          #
+          # (b) Compiled-CPU FUNCTIONAL tests that exercise the C++/kernel layer
+          #     this workflow builds from source — the correctness signal the
+          #     pure-Python layer structurally cannot give. Sourced from
+          #     upstream's own CPU hardware-CI list
+          #     (.buildkite/hardware_tests/cpu.yaml):
+          #       - kernels/attention/test_cpu_attn.py: CPU attention kernel
+          #         (cpu_attention_with_kv_cache etc. via vllm._custom_ops).
+          #       - v1/sample/test_topk_topp_sampler.py: top-k/top-p SAMPLER
+          #         logic on CPU torch. Its Triton- and FlashInfer-only test
+          #         classes self-skip (HAS_TRITON / is_cuda guards), so we get
+          #         the CPU-native sampler tests without installing triton-cpu.
+          #     Both self-skip cleanly via `current_platform.is_cpu()` /
+          #     capability guards if a given CPU ISA/op isn't present, so they
+          #     stay robust across runner generations rather than hard-failing.
+          #
           # Excluded deliberately:
           #   - tests/test_regression.py: instantiates real LLM(...) models ->
           #     HF download + inference, too heavy/networked for a smoke.
@@ -214,6 +234,9 @@ jobs:
           #     'g<sha>')). The test fails on ANY dev build regardless of code
           #     health, so it is environment-sensitive noise for a smoke gate,
           #     not a regression signal. Dropped (ADR-0007 curated-set rule).
+          #   - model/quant/distributed/multimodal CPU tests from cpu.yaml:
+          #     they download models (`-m cpu_model`), need triton-cpu, or spawn
+          #     multiple ranks — out of the T0 budget; they belong to T1/T2.
           CURATED_TESTS: >-
             tests/test_sequence.py
             tests/test_outputs.py
@@ -221,6 +244,8 @@ jobs:
             tests/test_envs.py
             tests/test_scalartype.py
             tests/transformers_utils/test_utils.py
+            tests/kernels/attention/test_cpu_attn.py
+            tests/v1/sample/test_topk_topp_sampler.py
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086
@@ -242,7 +267,8 @@ jobs:
             echo "| curated CPU pytest | ${PYTEST_OUTCOME:-skipped} |"
             echo
             echo "Curated set (CPU-safe, no GPU, no model download):"
-            echo "\`test_sequence test_outputs test_logger test_envs test_scalartype transformers_utils/test_utils\`"
+            echo "- core/plumbing: \`test_sequence test_outputs test_logger test_envs test_scalartype transformers_utils/test_utils\`"
+            echo "- compiled CPU: \`kernels/attention/test_cpu_attn\` (attention kernel), \`v1/sample/test_topk_topp_sampler\` (sampler)"
             echo
             echo "Tier-0 of the ADR-0007 functional-test strategy. GPU-smoke (T1)"
             echo "and on-demand kernel-test (T2) tiers are tracked there."
