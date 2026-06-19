@@ -85,6 +85,14 @@ env:
   UV_INDEX_STRATEGY: unsafe-best-match
   UV_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
   PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+  # Hugging Face download cache. Curated parser/tokenizer tests fetch small
+  # TOKENIZER files (KB-few MB, not weights) from the Hub; HF_HOME is restored
+  # across runs (Blacksmith sticky disk) so steady-state runs are a cache hit.
+  # The HF_TOKEN secret (org-level) authorizes gated repos (e.g. meta-llama).
+  # Mirrors upstream's CPU runner, which mounts ~/.cache/huggingface + HF_TOKEN
+  # (.buildkite/scripts/hardware_ci/run-cpu-test.sh).
+  HF_HOME: /home/runner/.cache/huggingface
+  HF_HUB_DOWNLOAD_TIMEOUT: "60"
 
 jobs:
   cpu-smoke:
@@ -147,6 +155,18 @@ jobs:
           key: bf-cpu-smoke-cargo-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             bf-cpu-smoke-cargo-${{ runner.os }}-
+
+      # Hugging Face tokenizer cache. Keyed on this workflow file so the cache
+      # lineage resets when the curated test list (and thus the set of
+      # tokenizers fetched) changes. Restore-keys let a changed list warm-start
+      # from the previous cache instead of a cold full re-fetch.
+      - name: Restore Hugging Face cache
+        uses: useblacksmith/cache@c5fe29eb0efdf1cf4186b9f7fcbbcbc0cf025662 # v5.1.0
+        with:
+          path: ${{ env.HF_HOME }}
+          key: bf-cpu-smoke-hf-${{ runner.os }}-${{ hashFiles('.github/workflows/bf-cpu-smoke.yml') }}
+          restore-keys: |
+            bf-cpu-smoke-hf-${{ runner.os }}-
 
       # System build deps, lifted from docker/Dockerfile.cpu (base-common):
       # gcc-12/g++-12 toolchain, ccache, numa, tcmalloc, plus the pinned protoc
@@ -240,19 +260,25 @@ jobs:
           #         the CPU-native sampler tests without installing triton-cpu.
           #         Confirmed pass/skip-clean on this runner.
           #
-          # (c) Output-PARSER FUNCTIONAL tests — reasoning parsers and tool-call
-          #     parsers, the structured-output surface our serving stack relies
-          #     on. These are pure-Python string->struct logic that use FAKE /
-          #     MagicMock tokenizers (the files state "no real model weights
-          #     required"), so they are fully offline — no HF download. Only
-          #     parser tests that build their own tokenizer are included; the
-          #     many sibling parser tests that `AutoTokenizer.from_pretrained(...)`
-          #     a real (often gated) repo are excluded as networked.
+          # (c) Output-PARSER FUNCTIONAL tests using FAKE / MagicMock tokenizers
+          #     (files state "no real model weights required") — reasoning and
+          #     tool-call parsers, the structured-output surface our serving
+          #     stack relies on. Fully offline, no HF download.
+          #
+          # (d) PARSER tests that fetch a real TOKENIZER from the Hub. Enabled
+          #     by the org-level HF_TOKEN secret (authorizes gated repos such as
+          #     meta-llama) + the restored HF_HOME cache. These pull only small
+          #     tokenizer files, not weights, and run no inference. This is the
+          #     coverage the offline-only restriction previously had to skip.
+          #
+          # NOTE (ADR-0007 curated-set drift): the upstream sync that landed on
+          # main moved/removed two files this list used to point at
+          # (test_minimax_m3_reasoning_parser.py and test_structural_tag_registry.py);
+          # they were repointed/replaced when re-verifying against the synced main.
           #
           # Excluded deliberately:
           #   - tests/test_regression.py: instantiates real LLM(...) models ->
-          #     HF download + inference, too heavy/networked for a smoke.
-          #   - tokenizer tests: network-fetch a tokenizer.
+          #     HF download + INFERENCE, too heavy for a smoke (T1).
           #   - tests/test_version.py: asserts the version TUPLE has 3-5 fields,
           #     but our from-source dev build produces a 6-field dev version
           #     (e.g. 0.23.1rc1.dev196+gc8b91b1a7 -> (0,23,1,'rc1','dev196',
@@ -270,6 +296,11 @@ jobs:
           #   - model/quant/distributed/multimodal CPU tests from cpu.yaml:
           #     they download models (`-m cpu_model`), need triton-cpu, or spawn
           #     multiple ranks — out of the T0 budget; they belong to T1/T2.
+          # HF_TOKEN authorizes gated tokenizer repos for layer (d). Sourced
+          # from the org-level secret; absent on forks, where layer (d) tests
+          # that hit a gated repo would fail auth — acceptable, this is a
+          # private mirror and PRs come from branches, not forks.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           CURATED_TESTS: >-
             tests/test_sequence.py
             tests/test_outputs.py
@@ -279,11 +310,15 @@ jobs:
             tests/transformers_utils/test_utils.py
             tests/v1/sample/test_topk_topp_sampler.py
             tests/reasoning/test_nemotron_v3_reasoning_parser.py
-            tests/reasoning/test_minimax_m3_reasoning_parser.py
             tests/tool_parsers/test_utils.py
             tests/tool_parsers/test_pythonic_tool_parser.py
             tests/tool_parsers/test_deepseekv32_tool_parser.py
-            tests/tool_parsers/test_structural_tag_registry.py
+            tests/tool_parsers/test_granite_tool_parser.py
+            tests/reasoning/test_deepseekr1_reasoning_parser.py
+            tests/reasoning/test_qwen3_reasoning_parser.py
+            tests/reasoning/test_minimax_m2_reasoning_parser.py
+            tests/tool_parsers/test_hermes_tool_parser.py
+            tests/tool_parsers/test_llama3_json_tool_parser.py
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086
@@ -306,10 +341,11 @@ jobs:
             echo "| Rust crate tests (vllm-rs) | ${RUST_OUTCOME:-skipped} |"
             echo "| curated CPU pytest | ${PYTEST_OUTCOME:-skipped} |"
             echo
-            echo "Curated set (CPU-safe, no GPU, no model download):"
+            echo "Curated set (CPU-safe, no GPU, no inference / weights):"
             echo "- core/plumbing: \`test_sequence test_outputs test_logger test_envs test_scalartype transformers_utils/test_utils\`"
             echo "- compiled CPU: \`v1/sample/test_topk_topp_sampler\` (sampler)"
-            echo "- parsers (offline, mock tokenizers): reasoning (\`nemotron_v3\`, \`minimax_m3\`) + tool-calling (\`utils\`, \`pythonic\`, \`deepseekv32\`, \`structural_tag_registry\`)"
+            echo "- parsers (offline, mock tokenizers): reasoning \`nemotron_v3\` + tool-calling \`utils pythonic deepseekv32 granite\`"
+            echo "- parsers (HF tokenizer via HF_TOKEN + cache): reasoning \`deepseekr1 qwen3 minimax_m2\` + tool-calling \`hermes llama3_json\`"
             echo
             echo "Tier-0 of the ADR-0007 functional-test strategy. GPU-smoke (T1)"
             echo "and on-demand kernel-test (T2) tiers are tracked there."
