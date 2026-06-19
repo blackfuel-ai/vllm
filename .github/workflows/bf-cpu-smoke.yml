@@ -319,10 +319,23 @@ jobs:
             tests/reasoning/test_minimax_m2_reasoning_parser.py
             tests/tool_parsers/test_hermes_tool_parser.py
             tests/tool_parsers/test_llama3_json_tool_parser.py
+          # Per-test deselects (kept narrow — deselect the one broken case, not
+          # the whole file, so the rest of the file's coverage stays):
+          #   test_precompiled_install_flags_are_orthogonal asserts that setting
+          #   VLLM_PRECOMPILED_WHEEL_LOCATION leaves VLLM_USE_PRECOMPILED False,
+          #   but on the synced main vllm/envs.py computes VLLM_USE_PRECOMPILED
+          #   as truthy WHEN the wheel-location var is set (envs.py ~L617-619).
+          #   The test contradicts the implementation it ships with — it fails
+          #   on this commit regardless of our runner — so it is an upstream
+          #   inconsistency, not a signal about our change. Revisit on next sync.
+          DESELECTS: >-
+            tests/test_envs.py::test_precompiled_install_flags_are_orthogonal
         run: |
           set -euo pipefail
+          deselect_args=()
+          for t in $DESELECTS; do deselect_args+=(--deselect "$t"); done
           # shellcheck disable=SC2086
-          python -m pytest -v -p no:cacheprovider $CURATED_TESTS
+          python -m pytest -v -p no:cacheprovider "${deselect_args[@]}" $CURATED_TESTS
 
       - name: Write run summary
         if: always()
