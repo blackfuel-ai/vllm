@@ -1,0 +1,109 @@
+# Runs the upstream-defined pre-commit suite on every PR.
+#
+# Source of truth is `.pre-commit-config.yaml` at the repo root, which is
+# inherited verbatim from vllm-project/vllm via the sync workflow (ADR-0002,
+# ADR-0003). When upstream bumps ruff / clang-format / actionlint / etc.,
+# this workflow picks the new versions up automatically on the next sync.
+#
+# Currently bf-vllm has not yet synced from upstream, so neither
+# `.pre-commit-config.yaml` nor `.github/workflows/matchers/*.json` exist
+# in the tree. This workflow is designed to be no-op-safe in that state:
+# pre-commit/action exits cleanly when there's no config file, and the
+# matcher-register step is guarded by file-exists tests.
+#
+# Why a dedicated workflow rather than folding into bf-lint:
+#   - bf-lint enforces *our* discipline (ADR link validity, .bf-paths
+#     syntax, bf-*.yml yaml shape). Cheap, fast, hand-written.
+#   - bf-precommit enforces *upstream's* lint config. Slower, churns with
+#     upstream, restart granularity matters when uv pip-compile flakes.
+#   Keeping them apart preserves the seam ADR-0003 introduced between
+#   bf-authored and upstream-authored CI surface.
+#
+# Convention: `bf-` filename prefix per ADR-0003 even though the work this
+# does is upstream's; the prefix is about who owns the workflow file, not
+# who owns the lint config. The pre-commit config itself is upstream's and
+# carries no `bf-` prefix.
+#
+# Upstream equivalent (referenced for tracking divergence):
+#   https://github.com/vllm-project/vllm/blob/main/.github/workflows/pre-commit.yml
+# Differences:
+#   - No `pre-run-check` gate (upstream uses it to throttle community PRs;
+#     bf-vllm is private and doesn't need it).
+#   - Adds `push` trigger on `main` so post-merge runs annotate the sha
+#     with pre-commit's verdict; useful for spotting upstream-sync PRs
+#     that introduced lint regressions.
+#   - Triggers same as upstream's hot path (opened/synchronize/reopened/
+#     labeled) minus `labeled` because we don't use a `ready` gate label.
+
+name: bf-precommit
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    # 15 min is generous against upstream's usual 1–2 min, but caps a
+    # hanging hook (uv pip-compile, network-stalled mypy install) well
+    # below GitHub's 360 min hard kill.
+    timeout-minutes: 15
+    steps:
+      # Third-party actions pinned by SHA + commented tag per the
+      # supply-chain hygiene rule from CLAUDE.md. SHAs and tags here track
+      # upstream's pre-commit.yml verbatim — bump when upstream bumps.
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+
+      # Detect whether the upstream pre-commit config has landed via sync
+      # yet. Until it does, pre-commit/action would fail with "No
+      # .pre-commit-config.yaml file found"; we want a no-op + green
+      # status check instead so this workflow can be required from Day 0.
+      - name: Check for .pre-commit-config.yaml
+        id: cfg
+        run: |
+          if [[ -f .pre-commit-config.yaml ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No .pre-commit-config.yaml in tree yet. Skipping pre-commit run. The file arrives with the first upstream sync (ADR-0002/0003) at which point this workflow self-activates."
+          fi
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        if: steps.cfg.outputs.present == 'true'
+        with:
+          python-version: "3.12"
+
+      # Optional: register upstream-provided problem matchers so lint
+      # findings show up inline on the PR diff. The matcher JSONs land at
+      # .github/workflows/matchers/*.json once the first upstream sync
+      # imports them; until then the directory is empty and the glob
+      # below expands to no files (`nullglob`), making this step a no-op.
+      # Globbing rather than naming matchers explicitly means any new
+      # matcher upstream adds (e.g. ruff, clang-format) is picked up
+      # automatically on the next sync, with no edit to this workflow.
+      - name: Register upstream problem matchers (if present)
+        if: steps.cfg.outputs.present == 'true'
+        run: |
+          shopt -s nullglob
+          for path in .github/workflows/matchers/*.json; do
+            echo "::add-matcher::./${path}"
+          done
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        if: steps.cfg.outputs.present == 'true'
+        with:
+          # `--all-files` reruns every hook on every file (cheap because
+          # pre-commit caches by content hash). `--hook-stage manual`
+          # selects the CI stage upstream defined in
+          # `default_stages: [pre-commit, manual]`.
+          extra_args: --all-files --hook-stage manual

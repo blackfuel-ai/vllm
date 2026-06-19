@@ -1,0 +1,214 @@
+# Enforces the [bf-patch] commit discipline from ADR-0003 on every PR
+# that touches upstream files (= files NOT matching .bf-paths).
+#
+# For each commit in the PR:
+#   - If the commit only modifies BF-additive files (.bf-paths-matching),
+#     no rule applies — skip.
+#   - If the commit modifies any upstream file, it MUST:
+#       1. Start its subject with "[bf-patch] ".
+#       2. Carry an `Upstream-status:` trailer with one of:
+#            candidate | submitted-#NNNN | pending-upstream-#NNNN
+#            | rejected | bf-only
+#       3. If status is `submitted-#NNNN` or `pending-upstream-#NNNN`,
+#          NNNN must be a positive integer (cheap shape check; we don't
+#          verify the upstream PR exists).
+#
+# Pure-upstream-sync commits (touch upstream files, authored by the sync
+# bot) are exempt — they carry no [bf-patch] tag because they're not BF
+# patches, they're merge commits from upstream-main. Detected by the
+# committer/author being the sync GitHub App (configurable below).
+
+name: bf-patches-trailer-lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bf-patches-trailer-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    # Sync PRs are exempt by ADR-0003: they merge upstream-main into main and
+    # so carry hundreds of upstream commits that legitimately touch upstream
+    # paths without a [bf-patch] trailer (they are not BF patches). The
+    # bot-login exemption below cannot cover them — upstream's own commits keep
+    # their original upstream author/committer (e.g. `GitHub <noreply@github.com>`
+    # from a web merge), not the sync bot — so gate the whole job on the
+    # `[sync]` title prefix instead.
+    if: ${{ !startsWith(github.event.pull_request.title, '[sync]') }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Enforce [bf-patch] discipline
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # GitHub-App bot logins exempted from the rule (sync /
+          # merge bots that touch upstream files legitimately).
+          # Bot logins on GitHub are suffixed `[bot]`. A commit is
+          # exempt when EITHER its author OR its committer is one of
+          # these bots — sync/merge commits carry the bot as the
+          # committer, not necessarily the author. Matching is done on
+          # the GitHub no-reply bot email shapes
+          # (`<login>@users.noreply.github.com` and
+          # `NNNNN+<login>@users.noreply.github.com`).
+          SYNC_BOT_LOGINS: "bf-vllm-sync[bot] dependabot[bot] renovate[bot] github-actions[bot]"
+        run: |
+          python3 - <<'PY'
+          import fnmatch, os, re, subprocess, sys
+          from pathlib import Path
+
+          # ---- Load .bf-paths ----
+          patterns = []
+          path = Path(".bf-paths")
+          if path.exists():
+              for line in path.read_text().splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  if line.endswith("/**"):
+                      patterns.append(("prefix", line[:-3].rstrip("/")))
+                  elif line.endswith("/"):
+                      patterns.append(("prefix", line.rstrip("/")))
+                  else:
+                      patterns.append(("glob", line))
+          else:
+              print("::warning::No .bf-paths at repo root; cannot classify. Skipping enforcement.")
+              sys.exit(0)
+
+          def is_bf(p: str) -> bool:
+              for kind, pat in patterns:
+                  if kind == "prefix":
+                      if p == pat or p.startswith(pat + "/"):
+                          return True
+                  else:
+                      if fnmatch.fnmatchcase(p, pat):
+                          return True
+                      if "/" not in pat and fnmatch.fnmatchcase(Path(p).name, pat):
+                          return True
+              return False
+
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          bot_logins = set(os.environ.get("SYNC_BOT_LOGINS", "").split())
+
+          # GitHub no-reply bot emails look like
+          #   <login>@users.noreply.github.com           (e.g. renovate[bot]@…)
+          #   NNNNN+<login>@users.noreply.github.com      (e.g. 49699333+dependabot[bot]@…)
+          # Extract the bare <login> so it can be compared to bot_logins.
+          BOT_EMAIL_RE = re.compile(
+              r"^(?:\d+\+)?(?P<login>.+\[bot\])@users\.noreply\.github\.com$"
+          )
+
+          def bot_login_from_email(email: str) -> str | None:
+              m = BOT_EMAIL_RE.match(email.strip())
+              return m.group("login") if m else None
+
+          def is_exempt_bot(sha: str) -> bool:
+              # A commit is exempt when its author OR committer is a known
+              # sync/merge bot. Match on the GitHub no-reply email shape
+              # (login derived from %ae/%ce), with the bot name (%an/%cn)
+              # as a fallback for the rare bot whose email isn't the
+              # no-reply form.
+              ident = subprocess.check_output(
+                  ["git", "log", "-1", "--pretty=%ae%n%ce%n%an%n%cn", sha],
+                  text=True,
+              ).splitlines()
+              author_email, committer_email = ident[0], ident[1]
+              author_name, committer_name = ident[2], ident[3]
+              for email in (author_email, committer_email):
+                  login = bot_login_from_email(email)
+                  if login and login in bot_logins:
+                      return True
+              for name in (author_name, committer_name):
+                  if name in bot_logins:
+                      return True
+              return False
+
+          # ---- Walk the PR's commits ----
+          shas = subprocess.check_output(
+              ["git", "rev-list", "--reverse", f"{base}..{head}"],
+              text=True,
+          ).strip().splitlines()
+
+          STATUS_RE = re.compile(
+              r"^Upstream-status:\s*"
+              r"(candidate|submitted-#[1-9]\d*|pending-upstream-#[1-9]\d*|rejected|bf-only)\s*$",
+              re.MULTILINE,
+          )
+
+          failures = []
+          for sha in shas:
+              if not sha:
+                  continue
+
+              if is_exempt_bot(sha):
+                  continue  # sync/dep bots (author or committer) exempt
+
+              files = subprocess.check_output(
+                  ["git", "show", "--name-only", "--pretty=", sha],
+                  text=True,
+              ).strip().splitlines()
+              upstream_files = [f for f in files if f and not is_bf(f)]
+              if not upstream_files:
+                  continue  # commit is pure BF-additive — no rule applies
+
+              subject = subprocess.check_output(
+                  ["git", "log", "-1", "--pretty=%s", sha], text=True
+              ).strip()
+              body = subprocess.check_output(
+                  ["git", "log", "-1", "--pretty=%b", sha], text=True
+              )
+
+              short = sha[:7]
+              if not subject.startswith("[bf-patch] "):
+                  failures.append(
+                      f"- `{short}` ({len(upstream_files)} upstream file(s)) — subject "
+                      f"missing `[bf-patch]` prefix: `{subject}`"
+                  )
+                  continue
+
+              if not STATUS_RE.search(body):
+                  failures.append(
+                      f"- `{short}` — `Upstream-status:` trailer missing or malformed. "
+                      f"Expected one of: candidate | submitted-#NNNN | "
+                      f"pending-upstream-#NNNN | rejected | bf-only."
+                  )
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if failures:
+              text = (
+                  "## bf-patches-trailer-lint — failure\n\n"
+                  f"{len(failures)} commit(s) touch upstream files without the "
+                  "required `[bf-patch]` discipline (ADR-0003):\n\n"
+                  + "\n".join(failures)
+                  + "\n\n"
+                  "Each offending commit needs:\n"
+                  "1. Subject prefixed with `[bf-patch] `.\n"
+                  "2. An `Upstream-status:` trailer at the bottom of the body, one of:\n"
+                  "   - `candidate` — intend to upstream within 14 days.\n"
+                  "   - `submitted-#NNNN` — upstream PR open.\n"
+                  "   - `pending-upstream-#NNNN` — cherry-picked from an in-flight upstream PR.\n"
+                  "   - `rejected` — upstream declined; we carry it.\n"
+                  "   - `bf-only` — never upstreamable (infra-specific).\n"
+              )
+              if summary_path:
+                  Path(summary_path).write_text(text)
+              print(text)
+              sys.exit(1)
+
+          msg = "## bf-patches-trailer-lint — passed\n\nNo offending commits."
+          if summary_path:
+              Path(summary_path).write_text(msg)
+          print(msg)
+          PY

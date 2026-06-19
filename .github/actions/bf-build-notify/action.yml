@@ -1,0 +1,228 @@
+# Composite action: report a from-upstream image build's outcome.
+#
+# Bundles the three steps every bf-build-*-image-from-upstream workflow runs
+# after "Build and push": measure the pushed image size, write a STEP_SUMMARY
+# metrics table, and post a Block Kit summary to Slack. Factored out so the
+# four build workflows (nvidia/rocm/cpu/cpu-bench) share one implementation —
+# previously ~105 duplicated lines per workflow.
+#
+# Designed to run with the calling job's `if: always()` semantics: pass the
+# build step's outcome via `build-outcome` and the action fails-closed
+# (image size "—", duration "unknown") rather than erroring when the build
+# failed or was skipped. The Slack post is gated on a non-empty
+# `slack-bot-token`, mirroring the old `env.SLACK_BOT_TOKEN != ''` guard.
+
+name: bf-build-notify
+description: >-
+  Measure pushed image size, record build metrics to the step summary, and post
+  a Block Kit build summary to Slack. Shared by the bf-build-*-image workflows.
+
+inputs:
+  image:
+    description: "Image repo without tag, e.g. ghcr.io/blackfuel-ai/bf-vllm/vllm-nvidia."
+    required: true
+  tag:
+    description: "Tag of the pushed image to measure, e.g. upstream-<short-sha>."
+    required: true
+  display-name:
+    description: "Image name shown in Slack, e.g. vllm-nvidia."
+    required: true
+  summary-title:
+    description: "STEP_SUMMARY heading, e.g. 'NVIDIA from-upstream build'."
+    required: true
+  arch-list:
+    description: "Build arch list (e.g. '9.0 10.0'); empty to omit the arch field/row."
+    required: false
+    default: ""
+  runner-default:
+    description: "Fallback runner label when RUNNER_NAME is unset."
+    required: false
+    default: blacksmith-16vcpu
+  started-epoch:
+    description: "Build start time (unix epoch) for the duration calculation."
+    required: true
+  build-outcome:
+    description: "outcome of the build-and-push step (success / failure / etc.)."
+    required: true
+  digest:
+    description: "Image digest output by the build-and-push step."
+    required: false
+    default: ""
+  slack-bot-token:
+    description: >-
+      Slack bot token; Slack post is skipped when empty. Must be an input —
+      composite actions cannot read the caller's `secrets` context, so the
+      caller passes `secrets.SLACK_BOT_TOKEN`. The channel is fixed below
+      (#bf-vllm-sync) since it is a plain id, not a secret.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Pushed image size: build-push-action does not emit it, so we read the
+    # compressed/registry size back from GHCR for the immutable tag we just
+    # pushed (the caller is already logged in). `imagetools inspect --raw`
+    # returns either a single manifest or a multi-arch index; jq walks both —
+    # for an index we fetch each child manifest and sum, otherwise we sum the
+    # one manifest's config + layers. always()-safe: if the build didn't push,
+    # report "—" and never fail.
+    - name: Measure pushed image size
+      id: size
+      if: always()
+      shell: bash
+      env:
+        REF: ${{ inputs.image }}:${{ inputs.tag }}
+        PUSHED: ${{ inputs.build-outcome }}
+      run: |
+        set -uo pipefail
+        # sum_sizes: config.size + every layers[].size for one manifest JSON,
+        # tolerating a missing .config or .layers (e.g. attestation manifests).
+        sum_sizes='([.config.size // 0] + [(.layers // [])[].size]) | add // 0'
+        # Sum the compressed size of REF's manifest(s); echoes total bytes or
+        # exits non-zero on any registry/parse error. `imagetools inspect --raw`
+        # returns a single manifest or a multi-arch index — we walk both.
+        compute_bytes() {
+          local raw m bytes=0 d
+          # repo = REF without its :tag, so child manifests are addressed by
+          # digest (repo@sha256:…). Derived from REF to stay self-contained.
+          local repo="${REF%:*}"
+          raw="$(docker buildx imagetools inspect "$REF" --raw)" || return 1
+          if echo "$raw" | jq -e '.manifests' >/dev/null 2>&1; then
+            # Index: sum each real child; skip unknown/unknown attestations.
+            while read -r d; do
+              m="$(docker buildx imagetools inspect "${repo}@${d}" --raw)" || return 1
+              bytes=$((bytes + $(echo "$m" | jq "$sum_sizes")))
+            done < <(echo "$raw" | jq -r \
+              '.manifests[] | select(.platform.os != "unknown") | .digest')
+          else
+            bytes="$(echo "$raw" | jq "$sum_sizes")"
+          fi
+          echo "$bytes"
+        }
+        # Never fail this always() step: on any error report "—". The build
+        # already succeeded and pushed by the time we get here.
+        human="—" ; size_bytes=0
+        if [ "$PUSHED" = "success" ] && bytes="$(compute_bytes)"; then
+          human="$(numfmt --to=iec --suffix=B --format='%.1f' "$bytes")"
+          size_bytes="$bytes"
+        fi
+        {
+          echo "size_human=$human"
+          echo "size_bytes=$size_bytes"
+        } >> "$GITHUB_OUTPUT"
+
+    # Build metrics (ADR-0005: build time is a first-class metric). Runs on
+    # success and failure so a failed build still records its duration and
+    # where it stopped. Writes a glanceable table to the run summary; the Slack
+    # step reuses the same numbers (exported as outputs — one source of truth).
+    - name: Record build metrics
+      id: metrics
+      if: always()
+      shell: bash
+      env:
+        OUTCOME: ${{ inputs.build-outcome }}
+        STARTED: ${{ inputs.started-epoch }}
+        DIGEST: ${{ inputs.digest }}
+        SHA: ${{ inputs.tag }}
+        SIZE: ${{ steps.size.outputs.size_human }}
+        TITLE: ${{ inputs.summary-title }}
+        ARCH: ${{ inputs.arch-list }}
+        RUNNER_DEFAULT: ${{ inputs.runner-default }}
+      run: |
+        set -euo pipefail
+        # STARTED may be empty if the build failed before the start-time step
+        # ran. Default to 0 so the always()-guarded metrics + Slack steps still
+        # fire on that path; render the duration as "unknown" rather than a
+        # nonsense value measured from the epoch.
+        if [ -n "${STARTED:-}" ] && [ "${STARTED}" -gt 0 ]; then
+          secs=$(( $(date +%s) - STARTED ))
+          dur="$(printf '%dh%02dm%02ds' $((secs/3600)) $(((secs%3600)/60)) $((secs%60)))"
+        else
+          secs=0
+          dur="unknown"
+        fi
+        if [ "$OUTCOME" = "success" ]; then status=":white_check_mark: success"; else status=":x: ${OUTCOME:-failed}"; fi
+        runner="${RUNNER_NAME:-$RUNNER_DEFAULT}"
+        {
+          echo "status=$status"
+          echo "duration=$dur"
+          echo "secs=$secs"
+          # Re-export the display fields so the Slack step reuses the exact
+          # same values rendered in the summary (no second source of truth).
+          echo "runner=$runner"
+          echo "digest=${DIGEST:-—}"
+          echo "sha=${SHA:-—}"
+          echo "size=${SIZE:-—}"
+        } >> "$GITHUB_OUTPUT"
+        {
+          echo "## $TITLE"
+          echo ""
+          echo "| field | value |"
+          echo "|---|---|"
+          echo "| result | $status |"
+          echo "| duration | $dur |"
+          echo "| runner | $runner |"
+          echo "| upstream sha | \`${SHA:-—}\` |"
+          echo "| image digest | \`${DIGEST:-—}\` |"
+          echo "| image size | ${SIZE:-—} |"
+          # Arch list only applies to the GPU builds; omit the row when empty.
+          [ -n "$ARCH" ] && echo "| arch list | $ARCH |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    # Build the Block Kit payload as JSON so the optional arch field drops out
+    # cleanly when arch-list is empty (a conditional YAML block is awkward).
+    # `text` is the required notification/preview fallback; `blocks` renders the
+    # full build summary inline — the same fields as the STEP_SUMMARY table.
+    - name: Render Slack payload
+      id: payload
+      if: ${{ always() && inputs.slack-bot-token != '' }}
+      shell: bash
+      env:
+        # Fixed channel #bf-vllm-sync (a plain id, not a secret) — shared by the
+        # sync workflow and all four image builds so build status is co-located.
+        CHANNEL: C0BAGEB5FST
+        NAME: ${{ inputs.display-name }}
+        STATUS: ${{ steps.metrics.outputs.status }}
+        SHA: ${{ steps.metrics.outputs.sha }}
+        DURATION: ${{ steps.metrics.outputs.duration }}
+        SIZE: ${{ steps.metrics.outputs.size }}
+        RUNNER: ${{ steps.metrics.outputs.runner }}
+        DIGEST: ${{ steps.metrics.outputs.digest }}
+        ARCH: ${{ inputs.arch-list }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        # Two-per-row mrkdwn fields; the arch field is appended only for GPU
+        # builds. jq builds valid JSON and escapes everything for us.
+        jq -n \
+          --arg channel "$CHANNEL" --arg name "$NAME" --arg status "$STATUS" \
+          --arg sha "$SHA" --arg duration "$DURATION" --arg size "$SIZE" \
+          --arg runner "$RUNNER" --arg digest "$DIGEST" --arg arch "$ARCH" \
+          --arg run_url "$RUN_URL" '
+          ( [ { type: "mrkdwn", text: ("*Duration*\n" + $duration) },
+              { type: "mrkdwn", text: ("*Image size*\n" + $size) },
+              { type: "mrkdwn", text: ("*Runner*\n" + $runner) } ]
+            + (if $arch != "" then [ { type: "mrkdwn", text: ("*Arch list*\n" + $arch) } ] else [] end)
+            + [ { type: "mrkdwn", text: ("*Digest*\n`" + $digest + "`") } ]
+          ) as $fields |
+          {
+            channel: $channel,
+            text: ($status + " " + $name + " upstream-" + $sha + " — built in " + $duration + " · " + $size),
+            blocks: [
+              { type: "section",
+                text: { type: "mrkdwn", text: ($status + " *" + $name + "* `upstream-" + $sha + "`") } },
+              { type: "section", fields: $fields },
+              { type: "context",
+                elements: [ { type: "mrkdwn", text: ("<" + $run_url + "|run log>") } ] }
+            ]
+          }' > "$RUNNER_TEMP/slack-payload.json"
+        echo "path=$RUNNER_TEMP/slack-payload.json" >> "$GITHUB_OUTPUT"
+
+    - name: Notify Slack
+      if: ${{ always() && inputs.slack-bot-token != '' }}
+      uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+      with:
+        method: chat.postMessage
+        token: ${{ inputs.slack-bot-token }}
+        payload-file-path: ${{ steps.payload.outputs.path }}

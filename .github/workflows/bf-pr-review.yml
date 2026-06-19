@@ -1,0 +1,55 @@
+# AI-powered PR review for bf-vllm via blackfuel-ai/bf-review-action.
+#
+# Mirrors blackfuel-ai/bf-review-action/examples/pr-review.yml @ 260bb23
+# verbatim, with one bf-vllm-specific deviation:
+#
+#   The action is pinned to commit SHA 260bb23e… (not @v1) until BLA-1483
+#   cuts a v1 tag on bf-review-action. Bump the `uses:` ref to @v1 once
+#   that ships.
+#
+# Prerequisites on the bf-review-action side (one-time, admin):
+#
+#   - Settings → Actions → General → Access → "Accessible from repositories
+#     in the 'blackfuel-ai' organization." That setting is what lets a
+#     bf-vllm workflow `uses:` a private cross-repo action via the default
+#     GITHUB_TOKEN. Without it, the workflow fails to load the action.
+#
+# Gating: bf-pr-review acts as a hard merge gate via the PR-review system,
+# not via status-check exit codes. Branch protection on `main` is configured
+# to require approving reviews + dismiss stale reviews on push, so a
+# `--request-changes` review from this workflow naturally blocks merge
+# until the PR is updated and re-reviewed.
+#
+# Future-optional: pass `approver-token: ${{ secrets.BF_REVIEWER_PAT }}` so
+# the verdict review lands under a dedicated bot identity instead of the
+# Actions runner. Not wired yet — wait until we have a real complaint about
+# the reviewer identity.
+
+name: bf-pr-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+concurrency:
+  group: bf-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip draft PRs
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # post sticky comment + push fixes if asked
+      pull-requests: write  # post sticky comment + submit PR review
+      issues: read          # read prior comments for previous-review carry-forward
+
+    steps:
+      - name: Run Claudish code review
+        # bf-review-action @ 260bb23 (merge of #3, verdict folded into main
+        # action). Bump to @v1 once BLA-1483 ships.
+        uses: blackfuel-ai/code-review@v1.0.3
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          github-token: ${{ github.token }}

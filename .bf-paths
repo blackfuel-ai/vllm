@@ -1,0 +1,72 @@
+# .bf-paths — manifest of Blackfuel-additive paths.
+#
+# Source of truth for the change-classification rule defined in ADR-0003.
+# Every file that lands on `main` is exactly one of:
+#
+#   * BF-additive — its path matches an entry below; never conflicts with
+#     upstream sync because upstream will never create these paths.
+#   * Upstream — anything else. Edits to upstream paths are [bf-patch]
+#     commits and need an Upstream-status: trailer (enforced by
+#     bf-patches-trailer-lint, planned).
+#
+# Syntax (.gitignore-style positive list):
+#   * comments start with #
+#   * blank lines ignored
+#   * `path/` matches that directory and everything under it
+#   * `path/**` is equivalent
+#   * `bf-*.yml` matches anywhere shell-glob would
+#   * `path/bf-*.yml` matches in a specific directory
+#
+# bf-lint.yml syntax-checks this file; bf-classification-lint.yml uses it
+# to classify every PR's diff.
+
+# Blackfuel-owned documentation tree (ADRs, agent context, runbooks).
+bf-docs/
+
+# Blackfuel-owned helper modules and scripts (version helper, release-
+# notes generator, agent-log, etc. — added incrementally as the mirror
+# grows).
+bf-tools/
+
+# Blackfuel-owned CI workflows. The bf- filename prefix is mandatory
+# per ADR-0003; the sync workflow deletes any non-bf-*.yml workflow file
+# on every merge so unprefixed inherited workflows never survive.
+.github/workflows/bf-*.yml
+.github/workflows/bf-*.yaml
+
+# Blackfuel-owned composite actions shared by the bf-build-* workflows.
+# Upstream ships no .github/actions/; the bf- dir prefix keeps them BF-owned.
+# Glob (not a `/**` prefix) so the .bf-paths matcher's fnmatch branch honors
+# the bf-* dir wildcard; fnmatch '*' spans '/', covering nested helper files.
+.github/actions/bf-*/*
+
+# Blackfuel-additive root Makefile. Upstream ships no Makefile at root,
+# so this never conflicts. Extend with dev shortcuts (lint, fmt, etc.)
+# as bf-vllm matures.
+Makefile
+
+# Self-reference: this manifest is Blackfuel-owned.
+.bf-paths
+
+# Blackfuel-owned PR/issue templates. Upstream ships its own
+# PULL_REQUEST_TEMPLATE.md (we replaced it in PR #4 — that one stays a
+# [bf-patch] for now because the path is upstream-owned). Anything we
+# add under .github/ISSUE_TEMPLATE/bf-*.md or similar is BF-additive.
+.github/ISSUE_TEMPLATE/bf-*.md
+.github/ISSUE_TEMPLATE/bf-*.yml
+
+# Blackfuel-owned skill definitions (planned, per ADR-0006).
+.claude/skills/bf-vllm-*/
+
+# Blackfuel-owned actionlint config. Upstream ships no actionlint.yaml; we add
+# one to declare the Blacksmith runner labels the bf-build-* workflows target
+# (ADR-0005) so the actionlint pre-commit hook accepts them.
+.github/actionlint.yaml
+
+# Blackfuel-owned lightweight CPU benchmark image. Upstream ships no
+# Dockerfile.cpu-bench or requirements/cpu-bench.txt — these are the build
+# recipe for the `vllm-cpu-bench` tool image (a stripped-down CPU image for
+# `vllm bench`), so the paths never conflict with an upstream sync even though
+# they live in otherwise upstream-owned directories.
+docker/Dockerfile.cpu-bench
+requirements/cpu-bench.txt

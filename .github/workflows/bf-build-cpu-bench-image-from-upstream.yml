@@ -1,0 +1,156 @@
+# .github/workflows/bf-build-cpu-bench-image-from-upstream.yml
+#
+# Manually-triggerable lightweight CPU benchmark image build off bare upstream
+# source. Produces the `upstream` channel (ADR-0004): no Blackfuel patch layer,
+# our Dockerfile, upstream's vLLM source. Pushes to GHCR as:
+#
+#   ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu-bench:upstream-<sha>
+#   ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu-bench:upstream-latest
+#
+# vllm-cpu-bench is a TOOL image for `vllm bench` (latency/throughput) on CPU.
+# It strips multimodal, grammar, and serving-only deps from the CPU image, so
+# it is small and fast to build and runs benchmarks without a GPU. It is never
+# engine-routed — it is tagged `channel=upstream` only for label consistency
+# with the other three build channels.
+#
+# Per ADR-0005 the velocity lever is the Blacksmith-native builder cache (Docker
+# layer + compiler-output caching, co-located with the runner). The Dockerfile's
+# `--mount=type=cache,target=/root/.cache/ccache` persists automatically on the
+# Blacksmith builder; vLLM's built-in USE_SCCACHE is deliberately left off — a
+# second on-disk cache plane is redundant and unnecessary for a build this light.
+
+name: bf-build-cpu-bench-image-from-upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Bare-upstream ref to build (branch, tag, or SHA)."
+        type: string
+        required: true
+        default: upstream-main
+      python_version:
+        description: "Python version for the bench venv."
+        type: choice
+        required: false
+        default: "3.12"
+        options:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: bf-build-cpu-bench-upstream-${{ github.event.inputs.upstream_ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu-bench
+
+jobs:
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - name: Record build start time
+        id: started
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream ref
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ github.event.inputs.upstream_ref }}
+
+      - name: Resolve build provenance
+        id: prov
+        # Tag uses a fixed 7-char abbreviation of the upstream commit (not
+        # `git rev-parse --short`, whose length varies as the repo grows);
+        # the label carries the full SHA for reproducibility. Matches the
+        # cpu/nvidia/rocm from-upstream workflows so all four tag identically.
+        run: |
+          set -euo pipefail
+          upstream_sha="$(git rev-parse HEAD)"
+          {
+            echo "upstream_sha=${upstream_sha}"
+            echo "upstream_short=${upstream_sha:0:7}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE }}
+          # `:upstream-<sha>` is immutable per build. `:upstream-latest` means
+          # "newest bare-upstream-HEAD build" (ADR-0004) — it is only moved by
+          # the upstream-main build, so an ad-hoc dispatch of a feature ref
+          # publishes only its immutable :upstream-<sha> tag and never clobbers
+          # the shared moving tag.
+          tags: |
+            type=raw,value=upstream-${{ steps.prov.outputs.upstream_short }}
+            type=raw,value=upstream-latest,enable=${{ github.event.inputs.upstream_ref == 'upstream-main' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/blackfuel-ai/bf-vllm
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            org.opencontainers.image.title=vLLM (Blackfuel, CPU bench)
+            org.opencontainers.image.version=upstream-${{ steps.prov.outputs.upstream_short }}
+            org.opencontainers.image.vendor=Blackfuel
+            ai.vllm.build.commit=${{ steps.prov.outputs.upstream_sha }}
+            ai.bf-vllm.build.commit=${{ github.sha }}
+            ai.bf-vllm.build.channel=upstream
+
+      - name: Build and push CPU bench image
+        id: build
+        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2
+        with:
+          context: .
+          file: docker/Dockerfile.cpu-bench
+          target: vllm-cpu-bench
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cap parallel C++ compile jobs to the runner's vCPU count and forward
+          # the AVX-feature gates the bench Dockerfile declares as ARGs. The CPU
+          # bench wheel is a from-source compile like the CPU image; max_jobs=4
+          # keeps the 4 concurrent cc1plus processes within this 4vcpu runner's
+          # RAM. The disabled AVX-512 features keep the wheel portable across the
+          # benchmark fleet (built without assuming AVX-512 on the runner).
+          build-args: |
+            PYTHON_VERSION=${{ github.event.inputs.python_version }}
+            VLLM_CPU_DISABLE_AVX512=true
+            VLLM_CPU_AVX512BF16=false
+            VLLM_CPU_AVX512VNNI=false
+            VLLM_CPU_AMXBF16=false
+            max_jobs=4
+
+      # Measure pushed image size, write the STEP_SUMMARY metrics table, and
+      # post a Block Kit build summary to Slack — all in one shared composite
+      # action (.github/actions/bf-build-notify). always() so a failed build
+      # still reports; fails closed to '—'. Slack is gated on the token below.
+      - name: Report build outcome
+        if: always()
+        uses: ./.github/actions/bf-build-notify
+        with:
+          image: ${{ env.IMAGE }}
+          tag: upstream-${{ steps.prov.outputs.upstream_short }}
+          display-name: vllm-cpu-bench
+          summary-title: CPU bench from-upstream build
+          runner-default: blacksmith-4vcpu
+          started-epoch: ${{ steps.started.outputs.epoch }}
+          build-outcome: ${{ steps.build.outcome }}
+          digest: ${{ steps.build.outputs.digest }}
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}

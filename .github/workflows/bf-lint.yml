@@ -1,0 +1,114 @@
+# .github/workflows/bf-lint.yml
+#
+# Required status check on main. Three checks:
+#   1. ADR internal-link validity (markdown links between bf-docs/*.md files
+#      must resolve to existing files).
+#   2. .bf-paths manifest syntax.
+#   3. yamllint on bf-* workflow files.
+#
+# Each check skips cleanly if the target doesn't exist. Adds real signal
+# as bf-vllm content grows, without blocking the early state where most
+# of the BF surface is still empty.
+
+name: bf-lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bf-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check ADR internal links
+        run: |
+          set -e
+          if ! find bf-docs -type f -name '*.md' -print -quit 2>/dev/null | grep -q .; then
+            echo "No bf-docs/*.md files yet; skipping link check."
+            exit 0
+          fi
+
+          FAILED=$(mktemp)
+          trap 'rm -f "$FAILED"' EXIT
+
+          while IFS= read -r -d '' f; do
+            dir=$(dirname "$f")
+            # Extract markdown link targets: [text](target)
+            grep -oE '\]\([^)]*\)' "$f" 2>/dev/null \
+              | sed 's/^](\(.*\))$/\1/' \
+              | while IFS= read -r target; do
+                  # Skip absolute URLs and protocol-prefixed targets
+                  case "$target" in
+                    http://*|https://*|mailto:*|ftp://*|javascript:*) continue ;;
+                  esac
+                  # Only validate .md targets (with optional #anchor)
+                  case "$target" in
+                    *.md|*.md#*) ;;
+                    *) continue ;;
+                  esac
+                  path="${target%#*}"
+                  [ -z "$path" ] && continue
+                  full="$dir/$path"
+                  if [ ! -f "$full" ]; then
+                    echo "::error file=$f::Broken internal link '$target' (expected at '$full')"
+                    echo "1" >> "$FAILED"
+                  fi
+                done
+          done < <(find bf-docs -type f -name '*.md' -print0)
+
+          if [ -s "$FAILED" ]; then
+            echo ""
+            echo "Failed: one or more broken internal links found."
+            exit 1
+          fi
+          echo "✓ All internal markdown links resolve"
+
+      - name: Validate .bf-paths syntax
+        run: |
+          set -e
+          if [ ! -f .bf-paths ]; then
+            echo "No .bf-paths yet; skipping."
+            exit 0
+          fi
+          line_num=0
+          while IFS= read -r line; do
+            line_num=$((line_num + 1))
+            line="${line%$'\r'}"
+            [ -z "$line" ] && continue
+            case "$line" in
+              \#*) continue ;;
+              [a-zA-Z./*]*) continue ;;
+              *)
+                echo "::error file=.bf-paths,line=$line_num::Invalid entry: '$line'"
+                exit 1
+                ;;
+            esac
+          done < .bf-paths
+          echo "✓ .bf-paths syntax OK"
+
+      - name: yamllint bf-* workflows
+        run: |
+          set -e
+          shopt -s nullglob
+          workflows=( .github/workflows/bf-*.yml .github/workflows/bf-*.yaml )
+          if [ ${#workflows[@]} -eq 0 ]; then
+            echo "No bf-* workflow files yet; skipping yamllint."
+            exit 0
+          fi
+          pip install --quiet yamllint
+          # Relaxed config: focus on structural correctness, not stylistic preferences.
+          yamllint -d '{extends: relaxed, rules: {line-length: disable, truthy: disable, comments: disable, document-start: disable}}' "${workflows[@]}"
+          echo "✓ yamllint passed on ${#workflows[@]} bf-* workflow file(s)"

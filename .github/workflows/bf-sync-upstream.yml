@@ -1,0 +1,580 @@
+# Daily tag-gated upstream sync for the bf-vllm private mirror.
+#
+# Implements the tag-gated two-branch sync of ADR-0002/0003/0006:
+#
+#   upstream-main : fast-forward-only mirror of vllm-project/vllm:main.
+#   main          : integration branch. The sync merges upstream into main
+#                   ONLY at a new upstream RELEASE-TAG commit — never an
+#                   arbitrary upstream-main HEAD (an untrusted mid-flight
+#                   commit). So main's upstream layer is always a trusted tag.
+#                   (NEVER rebase, NEVER force-push main — a hard guardrail in
+#                   ADR-0006.)
+#
+# What this workflow does on each run:
+#
+#   1. Mints an installation token for the `bf-vllm-sync` GitHub App. The
+#      default GITHUB_TOKEN cannot push to the protected upstream-main ref
+#      nor dispatch other workflows here, so every git push / PR / dispatch
+#      below uses the App token. The App commits as `bf-vllm-sync[bot]`,
+#      which bf-patches-trailer-lint exempts (its merge commits touch
+#      upstream files but are not [bf-patch]es).
+#   2. Fast-forwards upstream-main to upstream/main and pushes it, then
+#      mirrors any new upstream tags (so tags are always visible — releases
+#      and nightly branches reference them).
+#   3. Finds the NEWEST upstream release tag (vX.Y.Z or vX.Y.ZrcN — see
+#      RELEASE_TAG_RE) that is an ancestor of upstream-main but NOT yet an
+#      ancestor of main. If there is none, the run merges nothing (the common
+#      case — most days upstream cuts no new tag). Otherwise it merges THAT
+#      TAG'S COMMIT into a throwaway sync branch off main, applying ADR-0003's
+#      deterministic auto-resolutions:
+#        - prune every inherited (non-bf-*) workflow file (delete-on-sync);
+#        - modify/delete conflicts on those pruned files -> re-delete;
+#        - content conflicts on files touched by a `pending-upstream-#NNNN`
+#          BF commit -> take upstream (--theirs), since upstream has now
+#          incorporated the cherry-pick.
+#      Anything still conflicting is left for a human.
+#   4. Opens (or refreshes) the `[sync] merge upstream <tag> -> main` PR:
+#        - clean merge        -> normal PR ready for review;
+#        - unresolved conflict -> DRAFT PR labelled needs-manual-rebase
+#          listing the conflicting paths, instead of failing silently.
+#   5. Dispatches the from-upstream preview image builds (the `upstream`
+#      channel / nightly preview, ADR-0004). NOTE: this still builds off
+#      upstream-main HEAD for now; it is slated to move to a dedicated
+#      on-demand nightly workflow (ADR-0002 nightly side-branch) in a
+#      follow-up, after which it is removed from the sync.
+#   6. Notifies Slack: the sync outcome, the PR link, the conflicted-file
+#      count (on conflict), and — on a clean merge that advanced main to a new
+#      tag — a nudge that release v<tag>+bf.<bf> can be cut (bf bumped only if
+#      BF commits landed since the last release).
+#
+# A real run mutates upstream-main (and pushes tags) by design.
+
+name: bf-sync-upstream
+
+on:
+  schedule:
+    # Daily at 06:00 UTC, before EU working hours.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# Only one sync in flight at a time; never cancel a running sync mid-merge.
+concurrency:
+  group: bf-sync-upstream
+  cancel-in-progress: false
+
+# Minimal default GITHUB_TOKEN scope: this workflow never writes with it.
+# Every write (push upstream-main/tags/sync branch, create/edit the sync PR,
+# create labels, dispatch the build workflows) is done with the separately
+# minted bf-vllm-sync App installation token, whose effective access is
+# governed by the App installation — not by this block. `contents: read` is
+# only what the checkout needs.
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_URL: https://github.com/vllm-project/vllm.git
+  SYNC_BRANCH: bf-sync/upstream
+  # Which upstream tags gate a merge into main (ADR-0002 tag-gated merge):
+  # FINALS ONLY (vX.Y.Z). Release candidates (vX.Y.ZrcN) are deliberately NOT
+  # merged — an rc is a candidate upstream is still testing, so `main`'s
+  # upstream layer is only ever upstream's most-blessed final. Anything needed
+  # before the final tags is served from the on-demand nightly side-branch
+  # (ADR-0002), not from a release on `main`. A grep -E ERE anchored over
+  # `git tag` output, matching the upstream half of bf-tools/version.py's
+  # grammar — both decide what counts as a releasable upstream point. To also
+  # release on candidates, add `(rc[0-9]+)?` here and the matching `rcN` to
+  # version.py.
+  #
+  # The `$` anchor excludes our own bf release tags (`v0.20.2+bf.0.1.0` does
+  # not match — `+bf...` follows the patch number). As a second guard, the
+  # downstream `git merge-base --is-ancestor <tag> upstream-main` check would
+  # exclude a bf tag anyway, since it points at a commit on main, not on the
+  # bare upstream line.
+  RELEASE_TAG_RE: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  # Shared org Slack bot token (same one ai-platform uses). Surfaced into env
+  # so the optional notify step can gate on it (the `secrets` context is not
+  # allowed in a step `if:`). Empty when the secret is unset, which skips the
+  # notify step. Channel #bot-bf-vllm-sync; the bot must be a member of it.
+  SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+  SLACK_CHANNEL_ID: C0BAGEB5FST
+  # The from-upstream image builds the sync triggers after a successful run.
+  BUILD_WORKFLOWS: >-
+    bf-build-nvidia-image-from-upstream.yml
+    bf-build-cpu-image-from-upstream.yml
+    bf-build-rocm-image-from-upstream.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mint bf-vllm-sync App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.BF_VLLM_SYNC_CLIENT_ID }}
+          private-key: ${{ secrets.BF_VLLM_SYNC_PRIVATE_KEY }}
+
+      - name: Checkout main (full history)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          # All pushes (upstream-main, tags, sync branch) use the App token,
+          # not the default GITHUB_TOKEN, so the persisted credential is the App.
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure git identity (bf-vllm-sync bot)
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          # Commit as the App's bot user so merge commits are attributed to
+          # bf-vllm-sync[bot] and exempted by bf-patches-trailer-lint.
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Fast-forward upstream-main and find the next release tag
+        id: upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --prune upstream main --tags
+
+          git fetch origin upstream-main:upstream-main
+          git fetch origin main:main 2>/dev/null || git fetch origin main
+          before="$(git rev-parse upstream-main)"
+          # upstream-main is fast-forward-only: this fails loudly if the local
+          # mirror has somehow diverged from upstream/main (it never should).
+          git checkout upstream-main
+          git merge --ff-only upstream/main
+          after="$(git rev-parse upstream-main)"
+
+          # Push the advanced mirror and mirror any new tags FIRST (independent
+          # of whether we merge a tag into main this run — tags must always be
+          # visible). Both need the App token (upstream-main is a protected,
+          # bot-only ref per ADR-0002).
+          git push origin upstream-main
+          git push origin --tags
+
+          # --- Tag-gated merge target (ADR-0002): the release tag furthest
+          # along the upstream line that main has NOT yet merged. We must not
+          # rely on `git tag` version-sort to rank candidates: git's -v:refname
+          # sorts a release candidate ABOVE its final (v0.23.1rc0 > v0.23.1),
+          # the opposite of release precedence — so a "first already-merged tag,
+          # stop" scan would wrongly skip the newer final. Instead, among all
+          # release tags that are ancestors of upstream-main but NOT of main,
+          # pick the one with the most commits ahead of main (furthest down the
+          # linear upstream history = newest). Merging it brings any older
+          # unmerged tags' commits in transitively.
+          new_tag=""
+          tag_sha=""
+          best_ahead=-1
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            printf '%s\n' "$t" | grep -Eq "$RELEASE_TAG_RE" || continue
+            tsha="$(git rev-parse -q --verify "refs/tags/$t^{commit}")" || continue
+            # Must be a real point on the upstream line we mirror...
+            git merge-base --is-ancestor "$tsha" upstream-main || continue
+            # ...and not already on main (else it is a prior release we synced).
+            git merge-base --is-ancestor "$tsha" main && continue
+            ahead="$(git rev-list --count "main..$tsha")"
+            if [ "$ahead" -gt "$best_ahead" ]; then
+              best_ahead="$ahead"
+              new_tag="$t"
+              tag_sha="$tsha"
+            fi
+          done < <(git tag --list)
+
+          if [ -z "$new_tag" ]; then
+            echo "No new release tag for main; upstream-main is at $after."
+            changed=false
+            count=0
+          else
+            echo "Next release tag to merge into main: $new_tag ($tag_sha)"
+            changed=true
+            # count = upstream commits this tag adds over main's current base,
+            # for the notification (main..tag on the upstream line).
+            count="$(git rev-list --count "main..$tag_sha" 2>/dev/null || echo 0)"
+          fi
+          {
+            echo "changed=$changed"
+            echo "before=$before"
+            echo "before_short=$(git rev-parse --short "$before")"
+            echo "after=$after"
+            echo "short=$(git rev-parse --short upstream-main)"
+            echo "count=$count"
+            echo "new_tag=$new_tag"
+            echo "tag_sha=$tag_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Merge the release tag into the sync branch
+        id: merge
+        # Nothing to merge or PR when there is no new release tag for main.
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          NEW_TAG: ${{ steps.upstream.outputs.new_tag }}
+          TAG_SHA: ${{ steps.upstream.outputs.tag_sha }}
+        run: |
+          # SC2016: git pretty-format %(...) placeholders are expanded by git,
+          # not the shell, so the single-quoted --format strings are intentional.
+          # shellcheck disable=SC2016
+          set -euo pipefail
+          git checkout -B "$SYNC_BRANCH" origin/main
+
+          # Merge the RELEASE-TAG COMMIT (not upstream-main HEAD) without
+          # auto-committing, so we can apply the ADR-0003 deterministic
+          # resolutions before sealing the merge commit. A merge conflict is
+          # the one expected non-zero exit here (handled below via
+          # diff-filter=U), so it alone is tolerated; every other command keeps
+          # `set -e` semantics and aborts the run on failure.
+          git merge --no-ff --no-commit "$TAG_SHA" || true
+
+          # --- delete-on-sync: never let an inherited (non-bf-*) workflow
+          # survive on main (ADR-0003). Remove any workflow file that is not
+          # bf-*.yml / bf-*.yaml, plus the upstream-only support subdirs.
+          shopt -s nullglob
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            base="$(basename "$f")"
+            case "$base" in
+              bf-*) : ;;                       # keep BF-owned workflows
+              *) git rm -f --ignore-unmatch "$f" >/dev/null 2>&1 || rm -f "$f" ;;
+            esac
+          done
+          # Upstream support trees that only existed to serve inherited
+          # workflows. matchers/ is BF-owned (we keep our own); scripts/ is not.
+          for d in .github/workflows/scripts; do
+            [ -e "$d" ] && { git rm -rf --ignore-unmatch "$d" >/dev/null 2>&1 || rm -rf "$d"; }
+          done
+          shopt -u nullglob
+
+          # --- auto-resolve modify/delete on already-pruned inherited
+          # workflows: upstream changed a file we delete on sync -> re-delete.
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              .github/workflows/scripts/*)
+                git rm -f --ignore-unmatch "$path" >/dev/null 2>&1 || rm -f "$path"
+                ;;
+              .github/workflows/*)
+                b="$(basename "$path")"
+                case "$b" in
+                  bf-*) : ;;  # a real conflict on a BF workflow: leave it
+                  *) git rm -f --ignore-unmatch "$path" >/dev/null 2>&1 || rm -f "$path" ;;
+                esac
+                ;;
+            esac
+          done < <(git ls-files --deleted --unmerged | awk '{print $NF}' | sort -u)
+
+          # --- auto-resolve content conflicts on files a pending-upstream-*
+          # BF commit touched: upstream has incorporated the cherry-pick, so
+          # take upstream's canonical version (--theirs).
+          pending_files="$(
+            git log --no-merges --format='%H' origin/main \
+              | while read -r c; do
+                  if git show -s --format='%(trailers:key=Upstream-status)' "$c" \
+                      | grep -qiE 'pending-upstream-#?[0-9]+'; then
+                    git diff-tree --no-commit-id --name-only -r "$c"
+                  fi
+                done | sort -u
+          )"
+          conflicted="$(git diff --name-only --diff-filter=U | sort -u)"
+          if [ -n "$conflicted" ] && [ -n "$pending_files" ]; then
+            while IFS= read -r path; do
+              [ -z "$path" ] && continue
+              if printf '%s\n' "$pending_files" | grep -qxF "$path"; then
+                git checkout --theirs -- "$path" && git add -- "$path"
+              fi
+            done <<< "$conflicted"
+          fi
+
+          # Whatever still has conflict markers is a genuine human-needed merge.
+          remaining="$(git diff --name-only --diff-filter=U | sort -u)"
+          if [ -n "$remaining" ]; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "files<<EOF"
+              printf '%s\n' "$remaining"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            # Seal a WIP commit so the branch (with markers) can be pushed for
+            # a human to finish; the PR is opened as a draft below.
+            git add -A
+            git commit --no-verify -m "[sync] WIP merge upstream $NEW_TAG — unresolved conflicts" >/dev/null
+          else
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            git add -A
+            git commit --no-verify \
+              -m "[sync] merge upstream $NEW_TAG into main" >/dev/null
+          fi
+
+          git push --force-with-lease origin "$SYNC_BRANCH"
+
+      - name: Open or refresh the sync PR
+        id: pr
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.files }}
+          NEW_TAG: ${{ steps.upstream.outputs.new_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          title="[sync] merge upstream $NEW_TAG -> main"
+
+          if [ "$CONFLICT" = "true" ]; then
+            # Render each conflicting path as a backticked markdown bullet.
+            # tick held in a var so the literal backticks are not in a printf
+            # format string (keeps shellcheck from misreading them as a subshell).
+            tick='`'
+            bullets="$(printf '%s\n' "$CONFLICT_FILES" | while IFS= read -r p; do
+              [ -n "$p" ] && printf '%s\n' "- ${tick}${p}${tick}"
+            done)"
+            body="$(printf '%s\n' \
+              "Automated upstream sync hit conflicts the deterministic resolver could not handle." \
+              "" \
+              "**This branch contains conflict markers and must be resolved by a human** before merge." \
+              "" \
+              "Conflicting paths:" \
+              "$bullets" \
+              "" \
+              "Resolve on \`$SYNC_BRANCH\`, then mark this PR ready for review." )"
+            label="needs-manual-rebase"
+            color="b60205"; desc="Sync merge needs a human to resolve conflicts"
+            if ! gh label list --repo "$REPO" --search "$label" --json name -q '.[].name' | grep -qx "$label"; then
+              gh label create "$label" --color "$color" --description "$desc" --repo "$REPO" || true
+            fi
+          else
+            body="$(printf '%s\n' \
+              "Automated tag-gated upstream sync: merge upstream release tag \`$NEW_TAG\` into \`main\` (ADR-0002)." \
+              "" \
+              "\`main\`'s upstream layer is now exactly \`$NEW_TAG\` — a trusted upstream tag, not a mid-flight commit." \
+              "Clean merge — inherited non-\`bf-*\` workflows pruned per ADR-0003." \
+              "Bot-authored, so exempt from bf-classification-lint / bf-patches-trailer-lint." \
+              "" \
+              "On merge, release \`$NEW_TAG+bf.<bf>\` can be cut (see the Slack nudge)." )"
+          fi
+
+          existing="$(gh pr list --repo "$REPO" --head "$SYNC_BRANCH" --state open --json number -q '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "$REPO" --title "$title" --body "$body"
+            pr="$existing"
+          else
+            if [ "$CONFLICT" = "true" ]; then
+              pr="$(gh pr create --repo "$REPO" --base main --head "$SYNC_BRANCH" \
+                --title "$title" --body "$body" --draft --label "needs-manual-rebase")"
+            else
+              pr="$(gh pr create --repo "$REPO" --base main --head "$SYNC_BRANCH" \
+                --title "$title" --body "$body")"
+            fi
+          fi
+          echo "Sync PR: $pr"
+          # Normalize to a canonical URL (gh pr create emits a URL; an existing
+          # PR is a bare number) and the number, for the Slack notification.
+          url="$(gh pr view "$pr" --repo "$REPO" --json url -q '.url')"
+          number="$(gh pr view "$pr" --repo "$REPO" --json number -q '.number')"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch from-upstream image builds
+        # Only when the sync succeeded cleanly and upstream actually advanced —
+        # no point rebuilding :upstream-latest if nothing changed or a human
+        # still has to resolve the merge.
+        if: steps.upstream.outputs.changed == 'true' && steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # --ref main: the workflow DEFINITION to run lives on main (the
+          # bf-build-* files do not exist on upstream-main, which is bare
+          # upstream). upstream_ref=upstream-main is the input — the source the
+          # build checks out — so a fresh :upstream-latest is built each sync.
+          for wf in $BUILD_WORKFLOWS; do
+            if gh workflow view "$wf" --repo "$REPO" >/dev/null 2>&1; then
+              echo "Dispatching $wf (upstream_ref=upstream-main)"
+              gh workflow run "$wf" --repo "$REPO" --ref main -f upstream_ref=upstream-main
+            else
+              # ROCm (bf-build-rocm-image-from-upstream.yml) may not be merged
+              # yet; skip cleanly rather than fail the sync.
+              echo "::notice::$wf not present yet — skipping dispatch."
+            fi
+          done
+
+      - name: Compute the release nudge
+        id: nudge
+        # On a clean merge that advanced main to a new tag, propose the release
+        # to cut: v<new_tag>+bf.<bf>. The bf half increments ONLY if BF commits
+        # landed since the last bf release; otherwise it is a pure upstream
+        # re-pin under the same bf version (ADR-0002). This is ADVISORY only — a
+        # human runs bf-release.yml, which authoritatively picks/validates the
+        # bf bump (incl. ADR-0004's per-upstream-line independence: a brand-new
+        # upstream line should restart its bf count, which this global-latest
+        # heuristic does not model). Best-effort: never fails the sync.
+        #
+        # Gate directly on new_tag (not `changed`) so the contract — a nudge
+        # needs a tag — is explicit in the condition, not inferred from the
+        # upstream step's output assignments.
+        if: steps.upstream.outputs.new_tag != '' && steps.merge.outputs.conflict == 'false'
+        env:
+          NEW_TAG: ${{ steps.upstream.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          # Upstream line "vX.Y.Z" (drop any rcN) — bf counts run independently
+          # per upstream line (ADR-0004).
+          base="${NEW_TAG#v}"; base="${base%%rc*}"
+          # Latest bf release across all lines. Use `sort -V`, NOT git's
+          # -v:refname: the latter sorts a release candidate above its final
+          # (v0.23.1rc0 > v0.23.1), so it would pick the wrong baseline when an
+          # rc release precedes its final; `sort -V` follows release precedence.
+          last_rel="$(git tag --list '*+bf.*' | sort -V | tail -n1 || true)"
+
+          if [ -z "$last_rel" ]; then
+            # First-ever release: genesis bf version.
+            bf="0.1.0"; reason="first bf release"
+          else
+            last_bf="${last_rel#*+bf.}"
+            # BF commits since the last release = non-merge commits on main not
+            # reachable from the last release tag, excluding [sync] merges
+            # (those are upstream, not BF content).
+            bf_commits="$(git rev-list --no-merges --count "$last_rel"..main 2>/dev/null || echo 0)"
+            if [ "$bf_commits" -gt 0 ]; then
+              # New BF content → propose a MINOR bf bump (human confirms the
+              # exact MAJOR/MINOR/PATCH semantics in bf-release.yml).
+              IFS=. read -r M m _p <<EOF
+          $last_bf
+          EOF
+              bf="${M}.$((m + 1)).0"
+              reason="$bf_commits BF commit(s) since $last_rel → bf bump"
+            else
+              bf="$last_bf"
+              reason="no BF commits since $last_rel → upstream re-pin, bf unchanged"
+            fi
+          fi
+          release_tag="v${base}+bf.${bf}"
+          echo "Proposed release: $release_tag ($reason)"
+          {
+            echo "release_tag=$release_tag"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build Slack message
+        id: slack-msg
+        # Guarded: the shared bot token may be unset (e.g. on a fork). When it
+        # is, this step and the notify step are skipped, so its absence never
+        # fails the run. GitHub forbids the `secrets` context in a step `if:`,
+        # so the token is surfaced via the job-level SLACK_BOT_TOKEN env and
+        # gated on it. Always runs (even when nothing changed) so the channel
+        # has a heartbeat; emits a Block Kit payload to a file consumed by the
+        # notify step. jq builds every dynamic field so paths/SHAs/markdown are
+        # safely encoded.
+        if: ${{ env.SLACK_BOT_TOKEN != '' }}
+        env:
+          CHANGED: ${{ steps.upstream.outputs.changed }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.files }}
+          COUNT: ${{ steps.upstream.outputs.count }}
+          BEFORE_SHORT: ${{ steps.upstream.outputs.before_short }}
+          AFTER_SHORT: ${{ steps.upstream.outputs.short }}
+          AFTER_SHA: ${{ steps.upstream.outputs.after }}
+          BEFORE_SHA: ${{ steps.upstream.outputs.before }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          NEW_TAG: ${{ steps.upstream.outputs.new_tag }}
+          RELEASE_TAG: ${{ steps.nudge.outputs.release_tag }}
+          RELEASE_REASON: ${{ steps.nudge.outputs.reason }}
+          SYNC_BRANCH: ${{ env.SYNC_BRANCH }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
+        run: |
+          set -euo pipefail
+          compare="${GITHUB_SERVER_URL}/vllm-project/vllm/compare/${BEFORE_SHA}...${AFTER_SHA}"
+          payload_file="$RUNNER_TEMP/slack-payload.json"
+
+          if [ "$CHANGED" != "true" ]; then
+            header=":repeat: bf-vllm sync — no new release tag"
+            summary="upstream-main mirrored to \`$AFTER_SHORT\`, but no new release tag for \`main\` (tag-gated merge, ADR-0002). \`main\` unchanged, no PR opened."
+            blocks="$(jq -n --arg h "$header" --arg s "$summary" --arg run "$RUN_URL" '
+              [ {type:"header",text:{type:"plain_text",text:$h,emoji:true}},
+                {type:"section",text:{type:"mrkdwn",text:$s}},
+                {type:"context",elements:[{type:"mrkdwn",text:("<"+$run+"|workflow run>")}]} ]')"
+
+          elif [ "$CONFLICT" = "true" ]; then
+            header=":warning: bf-vllm sync — manual rebase needed"
+            # `CONFLICT_FILES` is attacker-influenceable: a filename in upstream
+            # git history could contain Slack mrkdwn / link / mention syntax
+            # (e.g. `<http://evil|click here>`, `*bold*`, `@here`). Sanitize
+            # before it reaches any mrkdwn section, else it renders as live
+            # markup (phishing/format-injection). Escape Slack's required three
+            # (`&`,`<`,`>`, ampersand first) so link/mention syntax is inert;
+            # the count is computed pre-truncation so a pathological history
+            # can't flood the channel.
+            files="$(printf '%s\n' "$CONFLICT_FILES" | sed '/^$/d')"
+            n_files="$(printf '%s\n' "$files" | grep -c . || true)"
+            esc_files="$(printf '%s\n' "$files" \
+              | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+            max_files=20
+            files_block="$(printf '%s\n' "$esc_files" | head -n "$max_files" \
+              | sed 's/^/• /')"
+            if [ "$n_files" -gt "$max_files" ]; then
+              files_block="$(printf '%s\n• …and %s more' \
+                "$files_block" "$((n_files - max_files))")"
+            fi
+            summary="$(printf '%s' \
+              "Merging upstream release tag \`$NEW_TAG\` ($COUNT commit(s) over \`main\`) into \`main\` hit conflicts the deterministic resolver (ADR-0003) could not auto-resolve. A *draft* PR with conflict markers is open and needs a human.")"
+            # printf %b expands the \n escapes into real newlines so Slack
+            # renders the command block, not literal backslash-n.
+            steps_md="$(printf '%b' \
+              "*Resolve it:*\n\`\`\`\ngit fetch origin\ngit switch $SYNC_BRANCH\ngit pull --ff-only\n# fix the <<<<<<< markers in the files above, then:\ngit add -A && git commit\ngit push origin $SYNC_BRANCH\n\`\`\`\nThen mark <$PR_URL|PR #$PR_NUMBER> *ready for review*.")"
+            ftitle="*$n_files conflicting file(s):*"
+            blocks="$(jq -n \
+              --arg h "$header" --arg s "$summary" \
+              --arg ftitle "$ftitle" \
+              --arg files "$files_block" \
+              --arg steps "$steps_md" \
+              --arg pr "$PR_URL" --arg prn "$PR_NUMBER" \
+              --arg cmp "$compare" --arg run "$RUN_URL" '
+              [ {type:"header",text:{type:"plain_text",text:$h,emoji:true}},
+                {type:"section",text:{type:"mrkdwn",text:$s}},
+                {type:"section",text:{type:"mrkdwn",text:($ftitle+"\n"+$files)}},
+                {type:"section",text:{type:"mrkdwn",text:$steps}},
+                {type:"context",elements:[{type:"mrkdwn",
+                  text:("<"+$pr+"|draft PR #"+$prn+"> · <"+$cmp+"|upstream diff> · <"+$run+"|run>")}]} ]')"
+
+          else
+            header=":white_check_mark: bf-vllm sync — release tag merged"
+            summary="$(printf '%s' \
+              "Merged upstream release tag \`$NEW_TAG\` ($COUNT commit(s) over \`main\`) into \`main\` cleanly. \`main\`'s upstream layer is now exactly \`$NEW_TAG\`. From-upstream preview image builds dispatched.")"
+            # Release nudge: once the PR merges, this release can be cut. A
+            # human runs bf-release.yml (picks/confirms the bf bump); the
+            # proposed version + reason come from the nudge step.
+            nudge_md="$(printf '%s' \
+              "*Release ready:* once <$PR_URL|PR #$PR_NUMBER> merges, cut \`$RELEASE_TAG\` — $RELEASE_REASON.")"
+            blocks="$(jq -n \
+              --arg h "$header" --arg s "$summary" \
+              --arg nudge "$nudge_md" \
+              --arg pr "$PR_URL" --arg prn "$PR_NUMBER" \
+              --arg cmp "$compare" --arg run "$RUN_URL" '
+              [ {type:"header",text:{type:"plain_text",text:$h,emoji:true}},
+                {type:"section",text:{type:"mrkdwn",text:$s}},
+                {type:"section",text:{type:"mrkdwn",text:("Review and merge <"+$pr+"|PR #"+$prn+">.")}},
+                {type:"section",text:{type:"mrkdwn",text:$nudge}},
+                {type:"context",elements:[{type:"mrkdwn",
+                  text:("<"+$pr+"|PR #"+$prn+"> · <"+$cmp+"|upstream diff> · <"+$run+"|run>")}]} ]')"
+          fi
+
+          # Top-level `text` is the notification/fallback (shown in the sidebar
+          # and by screen readers); blocks render the rich body.
+          fallback="$(printf '%s' "$header" | sed 's/:[a-z_]*: //')"
+          jq -n --arg ch "$CHANNEL" --arg text "$fallback" --argjson blocks "$blocks" \
+            '{channel:$ch, text:$text, blocks:$blocks}' > "$payload_file"
+          echo "payload_file=$payload_file" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack (optional)
+        if: ${{ env.SLACK_BOT_TOKEN != '' }}
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload-file-path: ${{ steps.slack-msg.outputs.payload_file }}

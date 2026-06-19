@@ -1,0 +1,164 @@
+# Classifies every PR's diff against .bf-paths (per ADR-0003) and emits
+# a per-PR summary distinguishing BF-additive changes from upstream
+# patches. Does NOT fail on patch presence — that's the job of
+# bf-patches-trailer-lint (planned). This workflow is informational +
+# label-driving.
+#
+# Outputs:
+#   - Step summary on every PR showing which files fell into each bucket.
+#   - A single PR label out of {bf-addition, bf-patches, bf-mixed},
+#     applied via gh CLI. Labels are created on demand if missing.
+
+name: bf-classification-lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: bf-classification-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import fnmatch, os, subprocess, sys
+          from pathlib import Path
+
+          # Load patterns from .bf-paths, gitignore-style.
+          patterns = []
+          path = Path(".bf-paths")
+          if path.exists():
+              for line in path.read_text().splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  # Normalize trailing /** and bare / to a directory prefix.
+                  if line.endswith("/**"):
+                      patterns.append(("prefix", line[:-3].rstrip("/")))
+                  elif line.endswith("/"):
+                      patterns.append(("prefix", line.rstrip("/")))
+                  else:
+                      patterns.append(("glob", line))
+          else:
+              print("::warning::No .bf-paths file at repo root; all changes will be classified as 'upstream'.")
+
+          def is_bf(p: str) -> str | None:
+              """Return the matching pattern if p is BF-additive, else None."""
+              for kind, pat in patterns:
+                  if kind == "prefix":
+                      if p == pat or p.startswith(pat + "/"):
+                          return pat + "/"
+                  else:
+                      if fnmatch.fnmatchcase(p, pat):
+                          return pat
+                      # Also try basename match for unanchored globs.
+                      if "/" not in pat and fnmatch.fnmatchcase(Path(p).name, pat):
+                          return pat
+              return None
+
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          diff = subprocess.check_output(
+              ["git", "diff", "--name-only", f"{base}...{head}"],
+              text=True,
+          ).strip().splitlines()
+
+          additive, patches = [], []
+          for f in diff:
+              if not f:
+                  continue
+              hit = is_bf(f)
+              (additive if hit else patches).append((f, hit))
+
+          # Build step summary.
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          lines = []
+          lines.append("## bf-classification-lint\n")
+          lines.append(f"Diff: `{base[:7]}` … `{head[:7]}`  ({len(diff)} files)\n")
+
+          if additive:
+              lines.append(f"### BF-additive ({len(additive)})\n")
+              lines.append("| File | Matched pattern |")
+              lines.append("|---|---|")
+              for f, hit in sorted(additive):
+                  lines.append(f"| `{f}` | `{hit}` |")
+              lines.append("")
+
+          if patches:
+              lines.append(f"### Upstream patches ({len(patches)})\n")
+              lines.append("These edits are subject to ADR-0003's `[bf-patch]` discipline. The companion `bf-patches-trailer-lint` workflow (planned) will enforce the commit-message prefix and `Upstream-status:` trailer.\n")
+              for f, _ in sorted(patches):
+                  lines.append(f"- `{f}`")
+              lines.append("")
+
+          if not additive and not patches:
+              lines.append("_No file changes detected in this PR._\n")
+
+          if summary_path:
+              Path(summary_path).write_text("\n".join(lines))
+
+          # Decide PR label.
+          if additive and patches:
+              label = "bf-mixed"
+          elif patches:
+              label = "bf-patches"
+          elif additive:
+              label = "bf-addition"
+          else:
+              label = ""
+
+          # Export for next step.
+          out = os.environ.get("GITHUB_OUTPUT")
+          if out:
+              with open(out, "a") as fh:
+                  fh.write(f"label={label}\n")
+                  fh.write(f"additive_count={len(additive)}\n")
+                  fh.write(f"patches_count={len(patches)}\n")
+          PY
+
+      - name: Apply classification label
+        if: steps.classify.outputs.label != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          LABEL: ${{ steps.classify.outputs.label }}
+        run: |
+          set -e
+          # Create label if missing (color picked per category for at-a-glance scanning).
+          case "$LABEL" in
+            bf-addition) color="0e8a16"; desc="Adds files in BF-owned paths only" ;;
+            bf-patches)  color="d93f0b"; desc="Edits upstream files; subject to [bf-patch] discipline" ;;
+            bf-mixed)    color="fbca04"; desc="Mixes BF-additive files with upstream patches" ;;
+            *) echo "unknown label $LABEL"; exit 1 ;;
+          esac
+          if ! gh label list --repo "$REPO" --search "$LABEL" --json name -q '.[].name' | grep -qx "$LABEL"; then
+            gh label create "$LABEL" --color "$color" --description "$desc" --repo "$REPO" || true
+          fi
+
+          # Remove any prior classification label, then add the current one.
+          for other in bf-addition bf-patches bf-mixed; do
+            if [ "$other" != "$LABEL" ]; then
+              gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$other" 2>/dev/null || true
+            fi
+          done
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$LABEL"
