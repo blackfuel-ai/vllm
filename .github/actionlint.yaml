@@ -1,0 +1,15 @@
+# actionlint configuration.
+#
+# Declares the self-hosted / third-party runner labels the bf-build-* image
+# workflows target (ADR-0005), so actionlint does not flag them as unknown.
+# These are Blacksmith-hosted runners provisioned at the GitHub-org level —
+# not in actionlint's built-in GitHub-hosted set. Keep this list in sync with
+# the runner labels every bf-build-* workflow targets: a new build workflow on
+# a different-sized runner (e.g. blacksmith-16vcpu-ubuntu-2404 for the heavier
+# GPU/ROCm compiles) must add its label here or actionlint will flag it.
+self-hosted-runner:
+  labels:
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-8vcpu-ubuntu-2404
+    - blacksmith-16vcpu-ubuntu-2404
+    - blacksmith-32vcpu-ubuntu-2404
