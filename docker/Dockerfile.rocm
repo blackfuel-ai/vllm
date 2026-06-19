@@ -1,3 +1,10 @@
+# check=skip=SecretsUsedInArgOrEnv
+# ^ [bf-patch] The SCCACHE_* ARG/ENV names trip BuildKit's secrets heuristic, but
+# none carry a secret: SCCACHE_S3_NO_CREDENTIALS is a 0/1 flag, SCCACHE_BUCKET_NAME
+# /REGION_NAME/ENDPOINT are non-secret S3 coordinates, and credentials (when the S3
+# path is used at all) are supplied out-of-band, never via build-args. Scope the
+# skip to this one rule so every other Dockerfile check still runs.
+
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
@@ -58,6 +65,11 @@ RUN curl -LsSf --retry 3 --retry-delay 5 https://astral.sh/uv/install.sh -o /tmp
 # This timeout (in seconds) is necessary when installing some dependencies via uv since it's likely to time out
 # Reference: https://github.com/astral-sh/uv/pull/1694
 ENV UV_HTTP_TIMEOUT=500
+# Retry wheel downloads on transient index failures (e.g. a 503 from
+# download.pytorch.org) so a brief upstream outage does not kill a long build.
+ENV UV_HTTP_RETRIES=5
+ENV PIP_RETRIES=5
+ENV PIP_DEFAULT_TIMEOUT=500
 ENV UV_INDEX_STRATEGY="unsafe-best-match"
 # Use copy mode to avoid hardlink failures with Docker cache mounts
 ENV UV_LINK_MODE=copy
@@ -93,12 +105,72 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
         fi; \
     fi
 
-# Set sccache environment variables only when USE_SCCACHE=1
-# This prevents S3 config from leaking into images when sccache is not used
+# [bf-patch] Make sccache use local disk when no S3 bucket is supplied, in every
+# `FROM base` build stage — without inheriting the rocm/vllm-dev base image's
+# baked-in S3 env vars.
+#
+# Two failure modes had to be killed (both observed in real ROCm builds):
+#   1. The previous `ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}`
+#      set an EMPTY-but-present SCCACHE_BUCKET for USE_SCCACHE=1 + empty bucket;
+#      sccache v0.8.1 reads empty-string SCCACHE_BUCKET as "S3 requested" and
+#      aborts: "create s3 cache failed ... bucket is misconfigured".
+#   2. The base image itself bakes SCCACHE_S3_NO_CREDENTIALS (and friends) with a
+#      value sccache rejects ("SCCACHE_S3_NO_CREDENTIALS must be 'true'/'0'/…"),
+#      which fires whenever the var is *present* — even in disk mode. Dropping
+#      our own ENV lines (a first attempt) just exposed the base image's value.
+#
+# Docker `ENV` cannot truly unset a var, and env vars override the config file,
+# so neither an empty ENV nor a config file alone is enough. Fix: wrap sccache.
+# /usr/bin/sccache becomes a shim that unsets ALL inherited S3 env vars and execs
+# the real binary, which then reads the backend from the config file we generate:
+#   empty bucket  => [cache.disk] at /sccache (BuildKit cache mount, Blacksmith-
+#                    persisted across runs, like the nvidia channel)
+#   non-empty     => [cache.s3] with the supplied bucket/region/endpoint.
+# Re-declare with the same defaults as the global ARGs (25-27) so an unset
+# build-arg still resolves to the documented default in this stage rather than
+# an empty string.
 ARG USE_SCCACHE
-ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET_NAME}}
-ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION_NAME}}
-ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_S3_NO_CREDENTIALS}}
+ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
+ARG SCCACHE_REGION_NAME=us-west-2
+ARG SCCACHE_ENDPOINT
+ARG SCCACHE_S3_NO_CREDENTIALS=0
+RUN if [ "$USE_SCCACHE" = "1" ]; then \
+        if [ -n "${SCCACHE_BUCKET_NAME}" ]; then \
+            # Escape backslash, double-quote and the control chars TOML treats
+            # specially (tab/CR/newline) so a bucket/region/endpoint value cannot
+            # corrupt or inject TOML entries. The S3 path is only reached with
+            # operator-supplied build-args, but escape defensively. (awk handles
+            # embedded newlines, which sed's line-oriented model cannot.)
+            esc() { printf '%s' "$1" | awk 'BEGIN{RS="\0"} {gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t"); gsub(/\r/,"\\r"); gsub(/\n/,"\\n"); printf "%s",$0}'; }; \
+            case "${SCCACHE_S3_NO_CREDENTIALS}" in 1|true|yes|on) nocred=true;; *) nocred=false;; esac; \
+            { \
+              echo "[cache.s3]"; \
+              echo "bucket = \"$(esc "${SCCACHE_BUCKET_NAME}")\""; \
+              echo "region = \"$(esc "${SCCACHE_REGION_NAME}")\""; \
+              [ -n "${SCCACHE_ENDPOINT}" ] && echo "endpoint = \"$(esc "${SCCACHE_ENDPOINT}")\""; \
+              echo "no_credentials = ${nocred}"; \
+            } > /etc/sccache.conf; \
+        else \
+            # No [cache.s3] section at all => sccache uses the disk backend; this
+            # is the path the from-upstream channel actually builds (empty bucket).
+            { \
+              echo "[cache.disk]"; \
+              echo "dir = \"/sccache\""; \
+            } > /etc/sccache.conf; \
+        fi; \
+        # The base image installs sccache at /usr/bin/sccache; command -v finds it
+        # there. Move it aside and replace it with the env-stripping shim. The
+        # guard keeps the step idempotent across cache reuse.
+        real="$(command -v sccache)"; \
+        if [ "$real" != "/usr/bin/sccache.real" ]; then mv "$real" /usr/bin/sccache.real; fi; \
+        { \
+          echo '#!/bin/sh'; \
+          echo 'unset SCCACHE_BUCKET SCCACHE_REGION SCCACHE_ENDPOINT SCCACHE_S3_NO_CREDENTIALS SCCACHE_S3_USE_SSL SCCACHE_S3_KEY_PREFIX'; \
+          echo 'exec /usr/bin/sccache.real "$@"'; \
+        } > /usr/bin/sccache && chmod +x /usr/bin/sccache; \
+    fi
+ENV SCCACHE_CONF=${USE_SCCACHE:+/etc/sccache.conf}
+ENV SCCACHE_DIR=${USE_SCCACHE:+/sccache}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 
 ARG COMMON_WORKDIR
@@ -138,27 +210,25 @@ RUN apt-get update -q -y && apt-get install -q -y --no-install-recommends \
 COPY tools/install_protoc.sh /tmp/install_protoc.sh
 RUN /tmp/install_protoc.sh && rm /tmp/install_protoc.sh
 
-# Install rustup; the toolchain itself is pinned by rust-toolchain.toml.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --profile minimal --default-toolchain none
-ENV PATH="/root/.cargo/bin:${PATH}"
-
 # Cap cargo parallelism to avoid exhausting the AMD CI host's open-file limit
 # (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
 ENV CARGO_BUILD_JOBS=4
 ENV CARGO_NET_RETRY=10
 ENV RUSTUP_MAX_RETRIES=10
 
+RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
+    cd ${COMMON_WORKDIR}/vllm \
+    && uv pip install --system -r requirements/build/rust.txt
+
 # Build the release binary. Cargo's registry/git caches can be written by
 # concurrent BuildKit jobs on shared workers, so lock those cache mounts while
-# keeping the cache benefit. Copy the binary out so it persists into the image
-# layer for later COPY --from=rust-build.
+# keeping the cache benefit. Do not cache target/, because stale target metadata
+# can outlive source updates across BuildKit cache reuse.
 RUN --mount=type=cache,id=vllm-rocm-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=vllm-rocm-cargo-git,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,id=vllm-rocm-cargo-target,target=${COMMON_WORKDIR}/vllm/rust/target,sharing=locked \
     cd ${COMMON_WORKDIR}/vllm \
-    && VLLM_RS_TARGET_PATH=/tmp/vllm-rs bash build_rust.sh \
-    && test -x /tmp/vllm-rs
+    && bash build_rust.sh \
+    && test -x vllm/vllm-rs
 
 # -----------------------
 # vLLM native build stages
@@ -178,6 +248,7 @@ RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
 # pyproject.toml is bind-mounted in the RUN step so metadata-only changes do
 # not invalidate the expensive native build layer.
 COPY setup.py CMakeLists.txt ./
+COPY tools/build_rust.py tools/build_rust.py
 COPY cmake cmake/
 COPY csrc csrc/
 COPY vllm/envs.py vllm/envs.py
@@ -209,9 +280,10 @@ ENV VLLM_TARGET_DEVICE=rocm
 
 COPY --from=csrc-build ${COMMON_WORKDIR}/vllm/dist /precompiled-wheels
 
-# Drop the pre-built rust frontend binary into the source tree. setup.py
-# detects it and ships it as-is, skipping the local cargo build.
-COPY --from=rust-build /tmp/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+# Drop the pre-built Rust artifacts into the source tree. setup.py detects
+# them and ships them as-is, skipping the local Rust build.
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/_rust_*.so ${COMMON_WORKDIR}/vllm/vllm/
 
 RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
     cd vllm \
@@ -307,11 +379,24 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # Generate RIXL wheel
 # Exclude libcore and libpull from auditwheel: transitive dependencies
 # that are not shipped in the wheel and vary across base images.
-RUN cd /opt/rixl && \
+#
+# [bf-patch] Force ccache (matching the RIXL library build just above) and keep
+# sccache out of this stage. build-wheel.sh runs its own meson-python build that
+# otherwise auto-picks the base image's sccache `c++` wrapper; meson-python
+# compiles vendored deps (abseil, prometheus-cpp) from an ephemeral .mesonpy-*
+# dir using RELATIVE paths, and the sccache server — running with a different CWD
+# than the client — then fails to hash them:
+#   sccache: error: while hashing the input file '/opt/rixl/.mesonpy-*/../subprojects/.../int128.cc'
+#   sccache: caused by: No such file or directory (os error 2)
+# ccache resolves the relative paths fine, so pin CC/CXX to it as the launcher.
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    cd /opt/rixl && \
     sed -i "s/--exclude 'libamdhip64\*'/--exclude 'libamdhip64*' --exclude 'libcore*' --exclude 'libpull*'/" \
         contrib/build-wheel.sh && \
     mkdir -p /app/install && \
     _ucx_install_dir=${UCX_HOME} \
+    CC="ccache gcc" CXX="ccache g++" \
+    CMAKE_C_COMPILER_LAUNCHER=ccache CMAKE_CXX_COMPILER_LAUNCHER=ccache \
     ./contrib/build-wheel.sh \
         --output-dir /app/install \
         --rocm-dir ${ROCM_PATH} \
@@ -418,9 +503,10 @@ FROM fetch_vllm AS build_vllm_wheel_release
 
 ARG COMMON_WORKDIR
 
-# Drop the pre-built rust frontend binary into the source tree. setup.py
-# detects it and ships it as-is, skipping the local cargo build.
-COPY --from=rust-build /tmp/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+# Drop the pre-built Rust artifacts into the source tree. setup.py detects
+# them and ships them as-is, skipping the local Rust build.
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/_rust_*.so ${COMMON_WORKDIR}/vllm/vllm/
 
 # Create /install directory for custom wheels
 RUN mkdir -p /install
@@ -638,7 +724,7 @@ RUN python3 -m pip install --upgrade pip && rm -rf /var/lib/apt/lists/*
 
 # Clean up sccache from release image (not needed at runtime)
 # This removes the binary and wrappers that may have been installed during build
-RUN rm -f /usr/bin/sccache || true \
+RUN rm -f /usr/bin/sccache /usr/bin/sccache.real /etc/sccache.conf || true \
     && rm -rf /opt/sccache-wrappers || true
 
 # Unset sccache environment variables for the release image
@@ -648,6 +734,8 @@ ENV SCCACHE_REGION=
 ENV SCCACHE_ENDPOINT=
 ENV SCCACHE_S3_NO_CREDENTIALS=
 ENV SCCACHE_IDLE_TIMEOUT=
+ENV SCCACHE_CONF=
+ENV SCCACHE_DIR=
 
 # Error related to odd state for numpy 1.20.3 where there is no METADATA etc, but an extra LICENSES_bundled.txt.
 # Manually remove it so that later steps of numpy upgrade can continue
