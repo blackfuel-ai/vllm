@@ -183,15 +183,15 @@ jobs:
           sudo PROTOC_VERSION=34.2 bash tools/install_protoc.sh
 
       # Build the Rust frontend (`vllm-rs`) the same way Dockerfile.cpu's
-      # rust-build stage does; setup.py picks up the prebuilt artifacts and
-      # skips an in-tree rebuild. build_rust.sh -> tools/build_rust.py imports
-      # setuptools_rust, so the rust build requirements must be installed first
-      # (Dockerfile.cpu installs requirements/build/rust.txt in its rust-build
-      # stage before invoking the build).
+      # rust-build stage does; setup.py picks up the prebuilt binary and skips
+      # an in-tree rebuild. build_rust.sh is self-contained — it installs rustup
+      # + the pinned toolchain (rust-toolchain.toml) and `cargo build`s the
+      # vllm-rs binary. (Upstream moved off the setuptools-rust path; there is
+      # no longer a requirements/build/rust.txt to install — the previous sync
+      # removed it, which is what broke this step until this fix.)
       - name: Build Rust frontend (vllm-rs)
         run: |
           set -euo pipefail
-          uv pip install -r requirements/build/rust.txt
           bash build_rust.sh
 
       - name: CPU build + install vLLM (editable)
