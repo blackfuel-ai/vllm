@@ -1,20 +1,40 @@
-<!-- markdownlint-disable -->
-PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTTOM) HAVE BEEN CONSIDERED.
+<!-- markdownlint-disable-file MD041 -->
+<!-- TITLE CONVENTION (per bf-docs/AGENTS.md → "PR title convention"):
+       [Type][Area] short subject in present-tense imperative
 
-## Purpose
+     Examples:
+       [Feat][CI] add bf-pr-review workflow
+       [Fix][bf-tools] handle empty .bf-paths gracefully
+       [Docs][ADR-0004] clarify channel→tag mapping
+       [bf-patch][CODEOWNERS] route bf-docs/ to core owners
 
-## Test Plan
+     `[bf-patch]` is the canonical type for commits editing upstream
+     files (per ADR-0003); pair it with the touched-file area. -->
 
-## Test Result
+## Summary
 
----
-<details>
-<summary> Essential Elements of an Effective PR Description Checklist </summary>
+<!-- One paragraph: what does this change and why? Link related ADRs if relevant. -->
 
-- [ ] The purpose of the PR, such as "Fix some issue (link existing issues this PR will resolve)".
-- [ ] The test plan, such as providing test command.
-- [ ] The test results, such as pasting the results comparison before and after, or e2e results
-- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model.
-</details>
+## Test plan
 
-**BEFORE SUBMITTING, PLEASE READ <https://docs.vllm.ai/en/latest/contributing>** (anything written below this line will be removed by GitHub Actions)
+<!-- How did you verify? Examples:
+       - CI lint + cpu-smoke passed
+       - Pulled :dev-pr-<N>-<sha> image and ran `--model <model>` smoke
+       - Deployed to staging engine deployment; benchmark sweep within tolerance
+       - N/A (docs-only change) -->
+
+## Classification
+
+<!-- `bf-classification-lint` auto-labels this PR as `bf-addition` or `bf-patches` (per ADR-0003).
+     If the lint flags it as mixed: split into two PRs.
+
+     For `[bf-patch]` commits (patches to upstream files), confirm each commit has:
+       - Subject prefix `[bf-patch]`
+       - `Upstream-status:` trailer set to one of: candidate | submitted-#NNNN |
+         pending-upstream-#NNNN | rejected | bf-only
+       - `Rationale:` trailer if status is `bf-only` or `rejected`
+       - `Upstream-original-sha:` trailer if status is `pending-upstream-#NNNN` -->
+
+## References
+
+<!-- Related ADRs (e.g., bf-docs/adr/0003-…), tracked issues, upstream PRs. -->

@@ -216,3 +216,37 @@ mkdocs.yaml @hmellor
 /docs/usage/security.md @russellb
 /SECURITY.md @russellb
 /docs/contributing/vulnerability_management.md @russellb
+
+# ============================================================
+# Blackfuel additions (bf-vllm private mirror)
+# ============================================================
+# These entries route review for Blackfuel-owned paths. They are append-only
+# at the file tail to minimize merge conflict surface with upstream's
+# component-by-component sections above. None of the patterns below can
+# match an upstream path — every bf-* path is guaranteed-unique by
+# convention (ADR-0003).
+
+# BF-owned documentation tree
+/bf-docs/                                    @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+
+# BF-owned helper modules
+/bf-tools/                                   @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+
+# BF-authored CI workflows
+/.github/workflows/bf-*.yml                  @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+/.github/workflows/bf-*.yaml                 @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+
+# BF-additive root Makefile (upstream has none)
+/Makefile                                    @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+
+# Change-classification manifest — guard tightly; editing it reshapes
+# bf-classification-lint and bf-patches-trailer-lint output across the
+# whole repo.
+/.bf-paths                                   @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+
+# CODEOWNERS itself (self-reference)
+/.github/CODEOWNERS                          @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+
+# Future BF-additive issue templates and skill definitions
+/.github/ISSUE_TEMPLATE/bf-*                 @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu
+/.claude/skills/bf-vllm-*/                   @blackfuel-ai/bf-approval-manager @dk-blackfuel @hdlj-bf @mtparet @nlenepveu

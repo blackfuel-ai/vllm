@@ -5,13 +5,21 @@ default_stages:
   - pre-commit # Run locally
   - manual # Run in CI
 exclude: 'vllm/third_party/.*'
+# BF-authored paths excluded from upstream-vLLM-specific hooks below. These hooks
+# encode vLLM-project conventions that do not apply to Blackfuel's own files:
+# the vLLM SPDX copyright line (provenance — must NOT appear on BF files), the
+# `import regex` mandate, and vLLM's ruff/markdownlint house style. Per-hook
+# `exclude:` regexes use the prefix `^(bf-tools|bf-docs)/`; extend that alternation
+# when new top-level `bf-*` directories are added.
 repos:
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.14.0
   hooks:
   - id: ruff-check
     args: [--output-format, github, --fix]
+    exclude: '^(bf-tools|bf-docs)/'
   - id: ruff-format
+    exclude: '^(bf-tools|bf-docs)/'
 - repo: https://github.com/crate-ci/typos
   rev: v1.43.5
   hooks:
@@ -30,7 +38,7 @@ repos:
   - id: markdownlint-cli2
     language_version: lts
     args: [--fix]
-    exclude: ^CLAUDE\.md$
+    exclude: '^(CLAUDE\.md$|bf-tools/|bf-docs/)'
 - repo: https://github.com/rhysd/actionlint
   rev: v1.7.7
   hooks:
@@ -198,6 +206,7 @@ repos:
     entry: python tools/pre_commit/check_spdx_header.py
     language: python
     types: [python]
+    exclude: '^(bf-tools|bf-docs)/'
   - id: check-root-lazy-imports
     name: Check root lazy imports
     entry: python tools/pre_commit/check_init_lazy_imports.py
@@ -228,6 +237,7 @@ repos:
     language: python
     types: [python]
     additional_dependencies: [regex]
+    exclude: '^(bf-tools|bf-docs)/'
   # prevent use torch.cuda APIs
   - id: check-torch-cuda-call
     name: "Prevent new 'torch.cuda' APIs call"
