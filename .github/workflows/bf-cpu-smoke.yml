@@ -15,7 +15,9 @@
 #      caches persist across runs on the Blacksmith sticky disk; a Docker build
 #      would re-import the world into a fresh image layer each PR.
 #   2. Asserts `import vllm` succeeds and prints the version.
-#   3. Runs a curated, CPU-safe slice of the inherited upstream `tests/` tree:
+#   3. Runs the Rust frontend crate's own unit tests (`vllm-rs`) via upstream's
+#      canonical cargo CI script — source-level, no model, no GPU.
+#   4. Runs a curated, CPU-safe slice of the inherited upstream `tests/` tree:
 #      pure-Python / import-level tests of core plumbing, PLUS a compiled-CPU
 #      functional test (the top-k/top-p sampler) drawn from upstream's own CPU
 #      hardware-CI list. Neither needs a GPU or a model
@@ -189,6 +191,24 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "vLLM import OK: ${VERSION}"
 
+      # Unit-test the Rust frontend crate (`vllm-rs`) at the source level. The
+      # workflow already COMPILES the crate (Build Rust frontend step) but never
+      # ran its own tests; the workspace carries a large suite incl. the Rust-
+      # native tool-parser and reasoning-parser crates. Reuse upstream's own
+      # canonical entry point (.buildkite/scripts/run-rust-frontend-cargo-ci.sh)
+      # rather than hand-rolling cargo invocations, so we track upstream's test
+      # command, feature flags, and toolchain pinning automatically on sync.
+      # The script is self-contained and idempotent: it installs protoc, the
+      # pinned toolchain, cargo-nextest, and a PyO3 Python (for the crates that
+      # bind to Python), short-circuiting each if already present — the rust
+      # toolchain and protoc are already warm from the build step above. Pure
+      # source-level tests: no model, no GPU, no network beyond tool installs.
+      - name: Run Rust crate tests (vllm-rs)
+        id: rust_tests
+        run: |
+          set -euo pipefail
+          bash .buildkite/scripts/run-rust-frontend-cargo-ci.sh test
+
       - name: Install curated-test dependencies
         run: |
           set -euo pipefail
@@ -274,6 +294,7 @@ jobs:
         env:
           VLLM_VERSION: ${{ steps.import.outputs.version }}
           IMPORT_OUTCOME: ${{ steps.import.outcome }}
+          RUST_OUTCOME: ${{ steps.rust_tests.outcome }}
           PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
         run: |
           {
@@ -282,6 +303,7 @@ jobs:
             echo "| Stage | Result |"
             echo "| --- | --- |"
             echo "| \`import vllm\` | ${IMPORT_OUTCOME:-skipped} (version: ${VLLM_VERSION:-n/a}) |"
+            echo "| Rust crate tests (vllm-rs) | ${RUST_OUTCOME:-skipped} |"
             echo "| curated CPU pytest | ${PYTEST_OUTCOME:-skipped} |"
             echo
             echo "Curated set (CPU-safe, no GPU, no model download):"
