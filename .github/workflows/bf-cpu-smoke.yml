@@ -220,6 +220,15 @@ jobs:
           #         the CPU-native sampler tests without installing triton-cpu.
           #         Confirmed pass/skip-clean on this runner.
           #
+          # (c) Output-PARSER FUNCTIONAL tests — reasoning parsers and tool-call
+          #     parsers, the structured-output surface our serving stack relies
+          #     on. These are pure-Python string->struct logic that use FAKE /
+          #     MagicMock tokenizers (the files state "no real model weights
+          #     required"), so they are fully offline — no HF download. Only
+          #     parser tests that build their own tokenizer are included; the
+          #     many sibling parser tests that `AutoTokenizer.from_pretrained(...)`
+          #     a real (often gated) repo are excluded as networked.
+          #
           # Excluded deliberately:
           #   - tests/test_regression.py: instantiates real LLM(...) models ->
           #     HF download + inference, too heavy/networked for a smoke.
@@ -249,6 +258,12 @@ jobs:
             tests/test_scalartype.py
             tests/transformers_utils/test_utils.py
             tests/v1/sample/test_topk_topp_sampler.py
+            tests/reasoning/test_nemotron_v3_reasoning_parser.py
+            tests/reasoning/test_minimax_m3_reasoning_parser.py
+            tests/tool_parsers/test_utils.py
+            tests/tool_parsers/test_pythonic_tool_parser.py
+            tests/tool_parsers/test_deepseekv32_tool_parser.py
+            tests/tool_parsers/test_structural_tag_registry.py
         run: |
           set -euo pipefail
           # shellcheck disable=SC2086
@@ -272,6 +287,7 @@ jobs:
             echo "Curated set (CPU-safe, no GPU, no model download):"
             echo "- core/plumbing: \`test_sequence test_outputs test_logger test_envs test_scalartype transformers_utils/test_utils\`"
             echo "- compiled CPU: \`v1/sample/test_topk_topp_sampler\` (sampler)"
+            echo "- parsers (offline, mock tokenizers): reasoning (\`nemotron_v3\`, \`minimax_m3\`) + tool-calling (\`utils\`, \`pythonic\`, \`deepseekv32\`, \`structural_tag_registry\`)"
             echo
             echo "Tier-0 of the ADR-0007 functional-test strategy. GPU-smoke (T1)"
             echo "and on-demand kernel-test (T2) tiers are tracked there."
