@@ -164,7 +164,7 @@ jobs:
           build-args: |
             USE_SCCACHE=1
             SCCACHE_BUCKET_NAME=
-            torch_cuda_arch_list=9.0 10.0
+            torch_cuda_arch_list=9.0a 10.0a
 
       # Measure pushed image size, write the STEP_SUMMARY metrics table, and
       # post a Block Kit build summary to Slack — all in one shared composite
@@ -178,7 +178,7 @@ jobs:
           tag: upstream-${{ steps.rev.outputs.upstream_short }}
           display-name: vllm-nvidia
           summary-title: NVIDIA from-upstream build
-          arch-list: 9.0 10.0
+          arch-list: 9.0a 10.0a
           runner-default: blacksmith-32vcpu
           started-epoch: ${{ steps.started.outputs.epoch }}
           build-outcome: ${{ steps.build.outcome }}
