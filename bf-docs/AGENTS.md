@@ -179,6 +179,8 @@ Pick the most specific one. If the change spans many areas, pick the dominant on
 
 Comments explain what the code **is** and **why** — the reasoning behind the *current* implementation — not when or why it changed. The iteration history belongs in git, not in the code.
 
+Keep them concise. Pick the precise word over the long phrase and say the idea once; a comment that restates the code earns nothing. Go long only when the idea genuinely needs it — a subtle invariant, a non-obvious constraint, a trap a future reader would otherwise fall into. Length should track the difficulty of the idea, nothing else.
+
 Forbidden are change-narration comments: `# changed from X`, `# new approach`, `# previously we did Y`, `# now using Z instead`, `# fixed bug where…`, `# was …`, and the like. A reader of the code at any point in time should see only the present state described; whoever needs the "before" reaches for `git blame` and `git log`.
 
 Two kinds of comment that *look* historical are legitimate and must be preserved, not stripped:
