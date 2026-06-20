@@ -175,6 +175,21 @@ Pick the most specific one. If the change spans many areas, pick the dominant on
 - Type + Area separation matches Conventional Commits semantics, which ai-platform already uses internally.
 - `[bf-patch]` survives as the literal ADR-0003 marker — `bf-patches-trailer-lint` looks for it on commit subjects too.
 
+## Code comment discipline
+
+Comments explain what the code **is** and **why** — the reasoning behind the *current* implementation — not when or why it changed. The iteration history belongs in git, not in the code.
+
+Keep them concise. Pick the precise word over the long phrase and say the idea once; a comment that restates the code earns nothing. Go long only when the idea genuinely needs it — a subtle invariant, a non-obvious constraint, a trap a future reader would otherwise fall into. Length should track the difficulty of the idea, nothing else.
+
+Forbidden are change-narration comments: `# changed from X`, `# new approach`, `# previously we did Y`, `# now using Z instead`, `# fixed bug where…`, `# was …`, and the like. A reader of the code at any point in time should see only the present state described; whoever needs the "before" reaches for `git blame` and `git log`.
+
+Two kinds of comment that *look* historical are legitimate and must be preserved, not stripped:
+
+- **Persistent upstream/external constraints** — e.g. `# 1-indexed because the upstream API returns a 1-indexed list`. These explain *why the current code is shaped this way* and stay true for as long as the constraint holds.
+- **Deprecation notices marking a deliberate transition state** — e.g. `# Deprecated: use new_auth() instead; remove after the v2 migration`. These follow the phased-migration convention and describe a current, intentional state rather than narrating a past edit.
+
+This applies equally to bf-authored code and to `[bf-patch]` edits of upstream files: do not narrate the patch in a comment. The `[bf-patch]` subject, the `Upstream-status:` trailer, and git history already carry that story ([ADR-0003](./adr/0003-change-classification-and-patch-discipline.md)).
+
 ## Documentation index
 
 - [`bf-docs/README.md`](./README.md) — BF doc index.
