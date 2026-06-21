@@ -164,7 +164,7 @@ jobs:
           build-args: |
             USE_SCCACHE=1
             SCCACHE_BUCKET_NAME=
-            torch_cuda_arch_list=9.0a 10.0a
+            torch_cuda_arch_list=9.0 10.0
 
       # Measure pushed image size, write the STEP_SUMMARY metrics table, and
       # post a Block Kit build summary to Slack — all in one shared composite
