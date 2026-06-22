@@ -4,8 +4,9 @@
 # `upstream` channel (ADR-0004): no Blackfuel patch layer, our Dockerfile,
 # upstream's vLLM source. Pushes to GHCR as:
 #
-#   ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu:upstream-<sha>
-#   ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu:upstream-latest
+#   ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-cpu:sha-<short>
+#   ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-cpu:vX.Y.Z   (release tags only)
+#   ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-cpu:latest   (upstream-main only)
 #
 # The CPU image is the lightest of the three providers — no GPU toolchain, no
 # CUDA/HIP kernel compilation. It serves models on CPU for testing without GPUs
@@ -40,7 +41,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu
+  # upstream channel = its own repository (ADR-0004 amendment 2026-06-22).
+  # The registry path is the channel signal, so tags are bare and
+  # vLLM-identical; the engine recognises an upstream image by this path and
+  # the production pool never points here.
+  IMAGE: ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-cpu
 
 jobs:
   build:
@@ -58,13 +63,37 @@ jobs:
 
       - name: Resolve build provenance
         id: prov
+        # `version` is the bare vLLM-identical name, set only when the built ref
+        # is an upstream release tag (vX.Y.Z[rcN]); a between-tags build leaves
+        # it empty and publishes only the sha pin (+ :latest for upstream-main).
+        env:
+          UPSTREAM_REF: ${{ github.event.inputs.upstream_ref }}
         run: |
           set -euo pipefail
           upstream_sha="$(git rev-parse HEAD)"
+          if printf '%s' "$UPSTREAM_REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'; then
+            version="$UPSTREAM_REF"
+          else
+            version=""
+          fi
           {
             echo "upstream_sha=${upstream_sha}"
             echo "upstream_short=${upstream_sha:0:7}"
+            echo "version=${version}"
           } >>"${GITHUB_OUTPUT}"
+
+      # The build context checked out above is bare upstream vLLM source (or, for
+      # rocm, the bf-vllm tree), so the bf-build-notify composite action is not
+      # reliably present at the workspace root. Sparse-checkout just .github/actions
+      # from the calling bf-vllm ref into bf-actions/ so `uses: ./bf-actions/...`
+      # below resolves on every arch. Mirrors nvidia's docker/Dockerfile overlay.
+      - name: Checkout BF composite actions from the calling ref
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          path: bf-actions
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
 
       - name: Set up Blacksmith Docker builder
         uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
@@ -81,21 +110,25 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ env.IMAGE }}
-          # `:upstream-<sha>` is immutable per build. `:upstream-latest` means
-          # "newest bare-upstream-HEAD build" (ADR-0004) — it is only moved by
-          # the upstream-main build (the sync's caller), so an ad-hoc dispatch
-          # of a feature ref publishes only its immutable :upstream-<sha> tag
-          # and never clobbers the shared moving tag.
+          # Bare, vLLM-identical tags in the dedicated upstream repository:
+          #   :sha-<short>  immutable per-build pin (always).
+          #   :vX.Y.Z       the release name, only when building a release tag.
+          #   :latest       the moving tag, only moved by the upstream-main build
+          #                 (the sync's caller); any other ref must not clobber it.
           tags: |
-            type=raw,value=upstream-${{ steps.prov.outputs.upstream_short }}
-            type=raw,value=upstream-latest,enable=${{ github.event.inputs.upstream_ref == 'upstream-main' }}
+            type=raw,value=sha-${{ steps.prov.outputs.upstream_short }}
+            type=raw,value=${{ steps.prov.outputs.version }},enable=${{ steps.prov.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ github.event.inputs.upstream_ref == 'upstream-main' }}
+          # ai.bf-vllm.build.channel stays as descriptive provenance — engine
+          # routing for the upstream channel is by repository path (ADR-0004).
           labels: |
             org.opencontainers.image.source=https://github.com/blackfuel-ai/bf-vllm
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             org.opencontainers.image.title=vLLM (Blackfuel, CPU)
             org.opencontainers.image.vendor=Blackfuel
-            org.opencontainers.image.version=upstream-${{ steps.prov.outputs.upstream_short }}
+            org.opencontainers.image.version=${{ steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.upstream_short) }}
+            ai.vllm.image.tag=${{ steps.prov.outputs.version }}
             ai.vllm.build.commit=${{ steps.prov.outputs.upstream_sha }}
             ai.bf-vllm.build.commit=${{ github.sha }}
             ai.bf-vllm.build.channel=upstream
@@ -125,10 +158,10 @@ jobs:
       # still reports; fails closed to '—'. Slack is gated on the token below.
       - name: Report build outcome
         if: always()
-        uses: ./.github/actions/bf-build-notify
+        uses: ./bf-actions/.github/actions/bf-build-notify
         with:
           image: ${{ env.IMAGE }}
-          tag: upstream-${{ steps.prov.outputs.upstream_short }}
+          image-tag: ${{ steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.upstream_short) }}
           display-name: vllm-cpu
           summary-title: CPU from-upstream build
           runner-default: blacksmith-4vcpu

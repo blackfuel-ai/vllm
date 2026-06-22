@@ -44,7 +44,11 @@ permissions:
   packages: write
 
 env:
-  IMAGE: ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm
+  # upstream channel = its own repository (ADR-0004 amendment 2026-06-22).
+  # The registry path is the channel signal, so tags are bare and
+  # vLLM-identical; the engine recognises an upstream image by this path and
+  # the production pool never points here.
+  IMAGE: ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-rocm
   # Pinned by digest for reproducibility. Resolved from the current
   # upstream default tag `rocm/vllm-dev:base` (linux/amd64, ROCm at
   # /opt/rocm, PYTORCH_ROCM_ARCH includes gfx942/gfx950 = MI300/MI325),
@@ -94,9 +98,9 @@ jobs:
       # passed through unchanged.
       #
       # The resolved SHA is what we both build (VLLM_BRANCH) and tag/label with,
-      # so the `:upstream-<sha>` tag identifies the actual vLLM source — matching
-      # the cpu/nvidia from-upstream workflows. Previously this tagged with
-      # github.sha (the bf-vllm Dockerfile commit), which is the wrong commit.
+      # so the `:sha-<short>` tag identifies the actual vLLM source (the upstream
+      # commit, not the bf-vllm Dockerfile commit) — matching the cpu/nvidia
+      # from-upstream workflows.
       - name: Resolve upstream provenance
         id: prov
         env:
@@ -131,13 +135,36 @@ jobs:
             echo "::error::upstream_ref '$UPSTREAM_REF' (resolved '$upstream_sha') does not resolve as a tag/branch on $vllm_repo. Pass a valid vLLM ref or 'upstream-main'." >&2
             exit 1
           fi
+          # `version` is the bare vLLM-identical name, set only when the built
+          # ref is an upstream release tag (vX.Y.Z[rcN]); a between-tags build
+          # (upstream-main or a bare sha) leaves it empty and publishes only the
+          # sha pin (+ :latest for upstream-main).
+          if printf '%s' "$UPSTREAM_REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'; then
+            version="$UPSTREAM_REF"
+          else
+            version=""
+          fi
           {
             echo "upstream_sha=${upstream_sha}"
             echo "upstream_short=${upstream_sha:0:7}"
+            echo "version=${version}"
           } >> "$GITHUB_OUTPUT"
 
       # Blacksmith-native Docker builder: persists BuildKit `type=cache`
       # mounts (our /sccache) across runs on the runner pool's local disk.
+      # The build context checked out above is bare upstream vLLM source (or, for
+      # rocm, the bf-vllm tree), so the bf-build-notify composite action is not
+      # reliably present at the workspace root. Sparse-checkout just .github/actions
+      # from the calling bf-vllm ref into bf-actions/ so `uses: ./bf-actions/...`
+      # below resolves on every arch. Mirrors nvidia's docker/Dockerfile overlay.
+      - name: Checkout BF composite actions from the calling ref
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          path: bf-actions
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
       - name: Set up Blacksmith Docker builder
         uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
 
@@ -153,24 +180,28 @@ jobs:
         uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
         with:
           images: ${{ env.IMAGE }}
-          # `upstream` channel tags per ADR-0004: immutable per-commit tag
-          # always; the shared moving `:upstream-latest` only when building
-          # the canonical upstream-main ref, so a manual dispatch of some
-          # other ref can't silently clobber it.
+          # Bare, vLLM-identical tags in the dedicated upstream repository
+          # (ADR-0004 amendment):
+          #   :sha-<short>  immutable per-build pin (always).
+          #   :vX.Y.Z       the release name, only when building a release tag.
+          #   :latest       the moving tag, only when building the canonical
+          #                 upstream-main ref; any other ref must not clobber it.
           tags: |
-            type=raw,value=upstream-${{ steps.prov.outputs.upstream_short }}
-            type=raw,value=upstream-latest,enable=${{ github.event.inputs.upstream_ref == 'upstream-main' }}
-          # OCI + bf-vllm channel labels per ADR-0004 §8b. channel=upstream.
+            type=raw,value=sha-${{ steps.prov.outputs.upstream_short }}
+            type=raw,value=${{ steps.prov.outputs.version }},enable=${{ steps.prov.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ github.event.inputs.upstream_ref == 'upstream-main' }}
           # image.revision / ai.bf-vllm.build.commit = the bf-vllm Dockerfile
           # commit (github.sha); ai.vllm.build.commit = the upstream vLLM commit
-          # actually built.
+          # actually built. ai.bf-vllm.build.channel stays descriptive — engine
+          # routing for the upstream channel is by repository path (ADR-0004).
           labels: |
             org.opencontainers.image.source=https://github.com/blackfuel-ai/bf-vllm
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=upstream-${{ steps.prov.outputs.upstream_short }}
+            org.opencontainers.image.version=${{ steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.upstream_short) }}
             org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             org.opencontainers.image.title=vLLM (Blackfuel, ROCm)
             org.opencontainers.image.vendor=Blackfuel
+            ai.vllm.image.tag=${{ steps.prov.outputs.version }}
             ai.bf-vllm.build.channel=upstream
             ai.bf-vllm.build.commit=${{ github.sha }}
             ai.vllm.build.commit=${{ steps.prov.outputs.upstream_sha }}
@@ -203,10 +234,10 @@ jobs:
       # still reports; fails closed to '—'. Slack is gated on the token below.
       - name: Report build outcome
         if: always()
-        uses: ./.github/actions/bf-build-notify
+        uses: ./bf-actions/.github/actions/bf-build-notify
         with:
           image: ${{ env.IMAGE }}
-          tag: upstream-${{ steps.prov.outputs.upstream_short }}
+          image-tag: ${{ steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.upstream_short) }}
           display-name: vllm-rocm
           summary-title: ROCm from-upstream build
           arch-list: gfx942 gfx950

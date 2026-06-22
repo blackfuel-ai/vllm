@@ -25,7 +25,7 @@ Build CI for ROCm + Nvidia (plus CPU variants), tuned aggressively for velocity.
 
 | Build event | Target | Current achievable | Lever |
 | --- | --- | --- | --- |
-| **Sync → `:upstream-latest`** rebuilt | ≤ 30 min | ~25 min | Blacksmith cache warm |
+| **Sync → upstream `:latest`** rebuilt | ≤ 30 min | ~25 min | Blacksmith cache warm |
 | **PR build (Python-only change)** | **≤ 5 min** | Achievable in v1 with wheel-base | Pre-compiled wheel base image |
 | **PR build (C++/CUDA change, warm cache)** | **≤ 10 min** | ~6-9 min | Blacksmith cache, arch-list trim |
 | **PR build (cold cache or invalidated)** | ≤ 30 min | ~20-30 min | arch-list trim |
