@@ -147,6 +147,25 @@ runs:
         fi
         if [ "$OUTCOME" = "success" ]; then status=":white_check_mark: success"; else status=":x: ${OUTCOME:-failed}"; fi
         runner="${RUNNER_NAME:-$RUNNER_DEFAULT}"
+        # Estimated runner cost = build minutes x Blacksmith list rate.
+        # Blacksmith Ubuntu x64 is $0.004/min per 2 vCPU and scales linearly
+        # with vCPU (https://www.blacksmith.sh/pricing — list price, not our
+        # contracted rate). Derive vCPU from the runner label (blacksmith-<N>vcpu)
+        # so all four build workflows share one rate model. The hourly rate is
+        # shown alongside so a wrong/stale table is obvious at a glance. Renders
+        # "—" when vCPU can't be parsed (non-blacksmith runner) or duration is 0.
+        vcpu="$(printf '%s' "$runner" | sed -nE 's/.*blacksmith-([0-9]+)vcpu.*/\1/p')"
+        if [ -n "$vcpu" ] && [ "$secs" -gt 0 ]; then
+          # rate_per_min = 0.004 * (vcpu / 2); cost = rate_per_min * (secs/60).
+          # awk (not bc) for the float math — awk is always present, bc is not
+          # guaranteed on every runner image.
+          cost_line="$(awk -v v="$vcpu" -v s="$secs" 'BEGIN {
+            rpm = 0.004 * (v / 2);
+            printf "$%.2f [$%.2f/h]", rpm * (s / 60), rpm * 60;
+          }')"
+        else
+          cost_line="—"
+        fi
         {
           echo "status=$status"
           echo "duration=$dur"
@@ -154,6 +173,7 @@ runs:
           # Re-export the display fields so the Slack step reuses the exact
           # same values rendered in the summary (no second source of truth).
           echo "runner=$runner"
+          echo "cost=$cost_line"
           echo "digest=${DIGEST:-—}"
           echo "tag=${TAG:-—}"
           echo "size=${SIZE:-—}"
@@ -166,6 +186,7 @@ runs:
           echo "| result | $status |"
           echo "| duration | $dur |"
           echo "| runner | $runner |"
+          echo "| est. cost | $cost_line |"
           echo "| image tag | \`${TAG:-—}\` |"
           echo "| image digest | \`${DIGEST:-—}\` |"
           echo "| image size | ${SIZE:-—} |"
@@ -194,6 +215,7 @@ runs:
         DURATION: ${{ steps.metrics.outputs.duration }}
         SIZE: ${{ steps.metrics.outputs.size }}
         RUNNER: ${{ steps.metrics.outputs.runner }}
+        COST: ${{ steps.metrics.outputs.cost }}
         DIGEST: ${{ steps.metrics.outputs.digest }}
         ARCH: ${{ inputs.arch-list }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -204,11 +226,12 @@ runs:
         jq -n \
           --arg channel "$CHANNEL" --arg name "$NAME" --arg status "$STATUS" \
           --arg tag "$TAG" --arg duration "$DURATION" --arg size "$SIZE" \
-          --arg runner "$RUNNER" --arg digest "$DIGEST" --arg arch "$ARCH" \
+          --arg runner "$RUNNER" --arg cost "$COST" --arg digest "$DIGEST" --arg arch "$ARCH" \
           --arg run_url "$RUN_URL" '
           ( [ { type: "mrkdwn", text: ("*Duration*\n" + $duration) },
               { type: "mrkdwn", text: ("*Image size*\n" + $size) },
-              { type: "mrkdwn", text: ("*Runner*\n" + $runner) } ]
+              { type: "mrkdwn", text: ("*Runner*\n" + $runner) },
+              { type: "mrkdwn", text: ("*Est. cost*\n" + $cost) } ]
             + (if $arch != "" then [ { type: "mrkdwn", text: ("*Arch list*\n" + $arch) } ] else [] end)
             + [ { type: "mrkdwn", text: ("*Digest*\n`" + $digest + "`") } ]
           ) as $fields |
