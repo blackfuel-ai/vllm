@@ -1,0 +1,284 @@
+# .github/workflows/bf-build-cpu-image.yml
+#
+# Manually-triggerable CPU image build, channel-aware (ADR-0004). One workflow
+# serves all three build channels; the `channel` input selects the registry
+# repository, tag scheme, OCI labels, and what source gets built:
+#
+#   channel=upstream  bare upstream vLLM at `ref`, no Blackfuel layer. Pushed to
+#                     the dedicated upstream repository whose PATH is the channel
+#                     signal (engine routes by repo, not label):
+#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-cpu:sha-<short>
+#                       …:vX.Y.Z   (upstream release tags only)
+#                       …:latest   (upstream-main only)
+#   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
+#                     Pushed to the shared repository, label-routed and never
+#                     auto-deployed:
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu:<scm-version>-dev
+#                     The tag embeds the scm-describe version (not a bare sha)
+#                     because the engine renders the image tag verbatim — a bare
+#                     sha would read as "no version" on the deployment page. The
+#                     scm-describe version already carries the commit (g<sha>),
+#                     so a manual dev build is uniquely identified without a PR
+#                     number; the per-PR :dev-pr-<N> form (ADR-0004) arrives with
+#                     the PR-triggered build wiring, not this manual dispatch.
+#   channel=release   the bf-vllm tree at the release ref, tagged with the
+#                     canonical release version. Orchestrated by bf-release.yml,
+#                     which passes `git_tag`; this workflow only builds + pushes.
+#                       …/vllm-cpu:<upstream>_bf.<bf>  (immutable release)
+#                       …/vllm-cpu:<upstream>_bf-latest
+#                       …/vllm-cpu:bf-stable
+#
+# The CPU image is the lightest of the providers — no GPU toolchain, no CUDA/HIP
+# kernel compilation. It serves models on CPU for testing without GPUs and backs
+# `vllm bench` runs. Per ADR-0005 the velocity lever is the Blacksmith-native
+# builder cache (Docker layer + compiler-output caching, co-located with the
+# runner); vLLM's built-in USE_SCCACHE is deliberately left off — a second
+# on-disk sccache plane is redundant on top of the Blacksmith builder and
+# unnecessary for a build this light.
+#
+# The upstream channel is dispatched by every sync for `upstream-main` so a new
+# upstream model is servable within minutes of landing (Goal #1).
+
+name: bf-build-cpu-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Build channel (ADR-0004): upstream (bare upstream), dev (bf-vllm tree, preview), release (bf-vllm tree at a release tag)."
+        type: choice
+        required: true
+        default: upstream
+        options:
+          - upstream
+          - dev
+          - release
+      ref:
+        description: "Source ref to build. upstream: a vLLM ref (branch/tag/SHA) or upstream-main. dev/release: a bf-vllm ref (branch/SHA/tag)."
+        type: string
+        required: true
+        default: upstream-main
+      git_tag:
+        description: "Release git tag (release channel only), e.g. v0.23.1rc0+bf.0.1.0. Mapped to the OCI image tag via bf-tools/version.py."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Per channel+ref: a dev push of commit B cancels the still-running build of
+  # commit A on the same ref, but an upstream build never cancels a dev build.
+  group: bf-build-cpu-${{ github.event.inputs.channel }}-${{ github.event.inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - name: Record build start time
+        id: started
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # The build context is the source at `ref`. For upstream that is bare
+      # upstream vLLM; for dev/release it is the bf-vllm tree (which already
+      # carries the BF layer). Either way docker/Dockerfile.cpu builds it the
+      # same way — only the registry repo, tags and labels differ by channel.
+      # fetch-depth: 0 + tags so the dev channel can `git describe` the tree
+      # against the release/upstream tags to derive a human-readable version.
+      - name: Checkout source at ref
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve channel, image repository, and provenance
+        id: prov
+        env:
+          CHANNEL: ${{ github.event.inputs.channel }}
+          REF: ${{ github.event.inputs.ref }}
+          GIT_TAG: ${{ github.event.inputs.git_tag }}
+          OWNER_IMAGE: ghcr.io/blackfuel-ai/bf-vllm
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short="${sha:0:7}"
+
+          # version: the bare vLLM-identical name for the upstream channel, set
+          # only when the built ref is an upstream release tag (vX.Y.Z[rcN]); a
+          # between-tags upstream build leaves it empty (sha pin + :latest only).
+          if printf '%s' "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'; then
+            version="$REF"
+          else
+            version=""
+          fi
+
+          case "$CHANNEL" in
+            upstream)
+              # Dedicated upstream repository: the path is the channel signal
+              # (ADR-0004 amendment), so tags stay bare and vLLM-identical.
+              image="${OWNER_IMAGE}/upstream/vllm-cpu"
+              ;;
+            dev|release)
+              # Shared repository, label-routed (ADR-0004).
+              image="${OWNER_IMAGE}/vllm-cpu"
+              ;;
+            *)
+              echo "::error::Unknown channel '${CHANNEL}'." >&2
+              exit 1
+              ;;
+          esac
+
+          # scm_version: the bf-vllm tree's self-description, the way vLLM names
+          # its own dev builds (git describe / setuptools-scm). Prefer the BF
+          # release line (v<upstream>+bf.<bf>); fall back to the upstream tag
+          # line when no BF release is reachable (a feature branch cut before the
+          # release, or a fresh upstream line). `+` -> `_` for OCI. Never fails:
+          # the upstream fallback always resolves on this mirror.
+          scm_raw="$(git describe --tags --match 'v*+bf.*' HEAD 2>/dev/null \
+                  || git describe --tags --match 'v[0-9]*' HEAD)"
+          scm_version="${scm_raw//+/_}"
+
+          # bf_image_tag / bf_version / bf_upstream: the canonical release
+          # identity, derived from git_tag via the single source of truth
+          # (bf-tools/version.py). Only consumed by the release channel;
+          # validated here so a malformed git_tag fails before the build.
+          bf_image_tag=""
+          bf_version=""
+          bf_upstream=""
+          if [ "$CHANNEL" = "release" ]; then
+            if [ -z "$GIT_TAG" ]; then
+              echo "::error::channel=release requires git_tag (e.g. v0.23.1rc0+bf.0.1.0)." >&2
+              exit 1
+            fi
+            read -r bf_image_tag bf_version bf_upstream < <(python - "$GIT_TAG" <<'PY'
+          import sys
+          sys.path.insert(0, "bf-tools")
+          from version import parse_git_tag
+          v = parse_git_tag(sys.argv[1])
+          print(v.image_tag, v.bf, v.upstream)
+          PY
+          )
+          fi
+
+          {
+            echo "channel=${CHANNEL}"
+            echo "image=${image}"
+            echo "sha=${sha}"
+            echo "short=${short}"
+            echo "version=${version}"
+            echo "scm_version=${scm_version}"
+            echo "bf_image_tag=${bf_image_tag}"
+            echo "bf_version=${bf_version}"
+            echo "bf_upstream=${bf_upstream}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The build context is the source at `ref` (bare upstream for the upstream
+      # channel; the bf-vllm tree for dev/release), so the bf-build-notify
+      # composite action is not reliably present at the workspace root. Sparse-
+      # checkout just .github/actions from the calling bf-vllm ref into
+      # bf-actions/ so `uses: ./bf-actions/...` below resolves on every channel.
+      - name: Checkout BF composite actions from the calling ref
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          path: bf-actions
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ steps.prov.outputs.image }}
+          # Tag scheme per channel (ADR-0004):
+          #   upstream — bare, vLLM-identical in the dedicated upstream repo:
+          #     :sha-<short> always; :vX.Y.Z on an upstream release tag;
+          #     :latest only for upstream-main (no other ref may clobber it).
+          #   dev — the scm-describe version + a -dev marker. The version (not a
+          #     bare sha) is what the engine shows verbatim on the deployment
+          #     page; the scm-describe version already embeds g<sha>, so it is
+          #     unique per commit.
+          #   release — the immutable release version + the two moving aliases
+          #     (<upstream>_bf-latest, bf-stable) that engine pinning/promotion
+          #     point at.
+          tags: |
+            type=raw,value=sha-${{ steps.prov.outputs.short }},enable=${{ steps.prov.outputs.channel == 'upstream' }}
+            type=raw,value=${{ steps.prov.outputs.version }},enable=${{ steps.prov.outputs.channel == 'upstream' && steps.prov.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ steps.prov.outputs.channel == 'upstream' && github.event.inputs.ref == 'upstream-main' }}
+            type=raw,value=${{ steps.prov.outputs.scm_version }}-dev,enable=${{ steps.prov.outputs.channel == 'dev' }}
+            type=raw,value=${{ steps.prov.outputs.bf_image_tag }},enable=${{ steps.prov.outputs.channel == 'release' }}
+            type=raw,value=${{ steps.prov.outputs.bf_upstream }}_bf-latest,enable=${{ steps.prov.outputs.channel == 'release' }}
+            type=raw,value=bf-stable,enable=${{ steps.prov.outputs.channel == 'release' }}
+          # Labels per ADR-0004's three namespaces. For the upstream channel
+          # ai.bf-vllm.build.channel is descriptive only (routing is by repo
+          # path); for dev/release it is the routing input. ai.vllm.* keep their
+          # upstream semantics. ai.bf-vllm.bf.version is set on release only;
+          # ai.bf-vllm.scm.version records the tree's describe-version so an
+          # agent (get_image_labels) can read lineage even off the tag.
+          labels: |
+            org.opencontainers.image.source=https://github.com/blackfuel-ai/bf-vllm
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            org.opencontainers.image.title=vLLM (Blackfuel, CPU)
+            org.opencontainers.image.vendor=Blackfuel
+            org.opencontainers.image.version=${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.version || steps.prov.outputs.scm_version) }}
+            ai.vllm.image.tag=${{ steps.prov.outputs.version }}
+            ai.vllm.build.commit=${{ steps.prov.outputs.sha }}
+            ai.bf-vllm.build.commit=${{ github.sha }}
+            ai.bf-vllm.build.channel=${{ steps.prov.outputs.channel }}
+            ai.bf-vllm.bf.version=${{ steps.prov.outputs.bf_version }}
+            ai.bf-vllm.scm.version=${{ steps.prov.outputs.scm_version }}
+
+      - name: Build and push CPU image
+        id: build
+        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2
+        with:
+          context: .
+          file: docker/Dockerfile.cpu
+          target: vllm-openai
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cap parallel C++ compile jobs to the runner's vCPU count. The CPU
+          # Dockerfile defaults max_jobs=32; 32 concurrent cc1plus processes on
+          # this blacksmith-4vcpu runner exhaust RAM mid-compile and the build
+          # dies with "cannot allocate memory" (cc1plus Killed). max_jobs is a
+          # declared ARG in docker/Dockerfile.cpu, so this build-arg reaches the
+          # build context on every channel.
+          build-args: |
+            max_jobs=4
+
+      # Measure pushed image size, write the STEP_SUMMARY metrics table, and
+      # post a Block Kit build summary to Slack — all in one shared composite
+      # action (.github/actions/bf-build-notify). always() so a failed build
+      # still reports; fails closed to '—'. Slack is gated on the token below.
+      - name: Report build outcome
+        if: always()
+        uses: ./bf-actions/.github/actions/bf-build-notify
+        with:
+          image: ${{ steps.prov.outputs.image }}
+          # The tag identifying this image best, by channel: the release version,
+          # else the scm-describe dev version, else the upstream version, else
+          # the sha pin — used to measure size and shown in the summary/Slack.
+          image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && format('{0}-dev', steps.prov.outputs.scm_version) || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.short))) }}
+          display-name: vllm-cpu
+          summary-title: CPU ${{ steps.prov.outputs.channel }} build
+          runner-default: blacksmith-4vcpu
+          started-epoch: ${{ steps.started.outputs.epoch }}
+          build-outcome: ${{ steps.build.outcome }}
+          digest: ${{ steps.build.outputs.digest }}
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
