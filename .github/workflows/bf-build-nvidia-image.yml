@@ -119,7 +119,9 @@ jobs:
           OWNER_IMAGE: ghcr.io/blackfuel-ai/bf-vllm
         run: |
           set -euo pipefail
-          sha="$(git rev-parse HEAD)"
+          # The source is checked out under src/ (the CUDA Dockerfile ingests it
+          # as the build context), so every git query against it needs -C src.
+          sha="$(git -C src rev-parse HEAD)"
           short="${sha:0:7}"
 
           # version: the bare vLLM-identical name for the upstream channel, set
