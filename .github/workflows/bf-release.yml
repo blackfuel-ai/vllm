@@ -417,6 +417,12 @@ jobs:
           tag_disp="${GIT_TAG:-(unresolved)}"
           release_url="${GITHUB_SERVER_URL}/${REPO}/releases/tag/${GIT_TAG}"
 
+          # Backslash-escape Slack mrkdwn formatting chars in the actor login so
+          # an underscore/asterisk in a username renders literally instead of as
+          # italic/bold. jq --arg already prevents JSON injection; this is the
+          # separate mrkdwn layer.
+          actor_disp="$(printf '%s' "${ACTOR:-—}" | sed -E 's/([*_~`])/\\\1/g')"
+
           # Image-tag pull strings, one per arch target the release builds (the
           # same GHCR repos generate-release-notes.py renders). Shown as the tags
           # the release WILL publish — release-channel image builds are still
@@ -464,7 +470,7 @@ jobs:
           if [ "$JOB_STATUS" = "success" ] && [ -f release-notes.md ]; then
             md="$(
               sed -E \
-                -e 's/^#{1,6}[[:space:]]+(.*)$/*\1*/' \
+                -e 's/^#{1,6}[[:space:]]+(.*[^[:space:]])[[:space:]]*$/*\1*/' \
                 -e 's/\[([^]]+)\]\(([^)]+)\)/<\2|\1>/g' \
                 release-notes.md
             )"
@@ -499,7 +505,7 @@ jobs:
             --arg upstream "$upstream_field" \
             --arg bf "${BF_VERSION:-—}" \
             --arg images "$images_field" \
-            --arg actor "${ACTOR:-—}" \
+            --arg actor "$actor_disp" \
             --arg status "$JOB_STATUS" \
             --arg run "$RUN_URL" \
             --argjson actions "$action_elems" \
