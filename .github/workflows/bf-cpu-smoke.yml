@@ -121,6 +121,7 @@ jobs:
           cache-dependency-glob: |
             requirements/cpu.txt
             requirements/build/cpu.txt
+            requirements/build/rust.txt
             requirements/common.txt
 
       # Create a uv venv and make it the default for every later step
@@ -183,15 +184,18 @@ jobs:
           sudo PROTOC_VERSION=34.2 bash tools/install_protoc.sh
 
       # Build the Rust frontend (`vllm-rs`) the same way Dockerfile.cpu's
-      # rust-build stage does; setup.py picks up the prebuilt binary and skips
-      # an in-tree rebuild. build_rust.sh is self-contained — it installs rustup
-      # + the pinned toolchain (rust-toolchain.toml) and `cargo build`s the
-      # vllm-rs binary. (Upstream moved off the setuptools-rust path; there is
-      # no longer a requirements/build/rust.txt to install — the previous sync
-      # removed it, which is what broke this step until this fix.)
+      # rust-build stage does. The Dockerfile installs the Rust build deps from
+      # requirements/build/rust.txt (setuptools, setuptools-rust, wheel) into the
+      # venv BEFORE running build_rust.sh, because build_rust.sh -> build_rust.py
+      # does `from setuptools_rust import ...`; build_rust.sh itself only
+      # bootstraps rustup + the pinned toolchain, not the Python build deps. We
+      # mirror that install here (the `uv venv --seed` venv seeds pip but not
+      # setuptools on 3.12). setup.py then picks up the prebuilt binary and skips
+      # an in-tree rebuild.
       - name: Build Rust frontend (vllm-rs)
         run: |
           set -euo pipefail
+          uv pip install -r requirements/build/rust.txt
           bash build_rust.sh
 
       - name: CPU build + install vLLM (editable)
