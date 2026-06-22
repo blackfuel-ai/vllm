@@ -1,0 +1,365 @@
+# .github/workflows/bf-cpu-smoke.yml
+#
+# Tier-0 functional smoke test (ADR-0007). This is bf-vllm's FIRST functional
+# CI gate: every other workflow (bf-lint, bf-precommit, bf-classification-lint,
+# bf-patches-trailer-lint, bf-pr-review) checks discipline and lint but NEVER
+# imports vLLM or runs a line of model code. A PR could break `import vllm`, a
+# CPU kernel, or the sampler and stay green. This closes that gap on the
+# cheapest tier: CPU-only, no GPU runner, no model download.
+#
+# What it does (T0 per ADR-0007):
+#   1. Builds vLLM from source for CPU (VLLM_TARGET_DEVICE=cpu), mirroring the
+#      host-side incantation in docker/Dockerfile.cpu (apt deps -> pinned
+#      protoc -> Rust frontend `vllm-rs` -> editable install). We build on the
+#      bare runner rather than via the Dockerfile so the uv + ccache + cargo
+#      caches persist across runs on the Blacksmith sticky disk; a Docker build
+#      would re-import the world into a fresh image layer each PR.
+#   2. Asserts `import vllm` succeeds and prints the version.
+#   3. Runs the Rust frontend crate's own unit tests (`vllm-rs`) via upstream's
+#      canonical cargo CI script — source-level, no model, no GPU.
+#   4. Runs a curated, CPU-safe slice of the inherited upstream `tests/` tree:
+#      pure-Python / import-level tests of core plumbing, PLUS a compiled-CPU
+#      functional test (the top-k/top-p sampler) drawn from upstream's own CPU
+#      hardware-CI list. Neither needs a GPU or a model
+#      download. This is the payoff for the sync workflow (ADR-0002): upstream
+#      drift that breaks our [bf-patch]es or `bf/files` goes red on the [sync]
+#      PR BEFORE merge instead of surfacing in production.
+#
+# Why this gates [sync] PRs too (deliberately NOT exempt, unlike
+# bf-patches-trailer-lint): a sync's entire reason for existing as a risk is
+# that it drops hundreds of upstream commits onto `main`. That is precisely
+# when we most want a functional floor. The trailer-lint exemption is about
+# commit-message discipline (irrelevant to upstream commits); a functional
+# smoke is about whether the merged tree still imports and runs.
+#
+# CURATED-SET MAINTENANCE (ADR-0007 Consequences): the file list below is
+# inherited from upstream and upstream MOVES/RENAMES test files. The list was
+# re-verified against `main` when this workflow landed (several originally
+# proposed paths — test_sampling_params.py, test_logits_processor.py,
+# tests/tokenization/, test_utils.py — had already moved/renamed upstream and
+# were replaced). When a sync deletes/renames one of these, this job fails on
+# collection; fix forward by repointing at the moved file (or dropping it).
+#
+# Runner: blacksmith-4vcpu-ubuntu-2404. Same free-tier CPU class the
+# bf-build-cpu image build already targets, so the runner label is already
+# declared in .github/actionlint.yaml (ADR-0005) and the Blacksmith sticky-disk
+# cache plane is co-located with the runner. 4 vCPU keeps the C++ compile from
+# OOMing (see bf-build-cpu-image: 32 concurrent cc1plus exhaust RAM); bump to
+# blacksmith-8vcpu-ubuntu-2404 if the cold compile overruns the time budget.
+#
+# Status: ships as a NORMAL (non-required) check. The operator marks it
+# `required` on `main` after a few green runs confirm the cold-build time and
+# the curated set are stable. Until then it is advisory.
+
+name: bf-cpu-smoke
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # vLLM's supported Python (docker/Dockerfile.cpu default; pyproject pins
+  # >=3.10,<3.15). Keep in lockstep with the Dockerfile's PYTHON_VERSION ARG.
+  PYTHON_VERSION: "3.12"
+  # CPU build env, lifted verbatim from docker/Dockerfile.cpu (base-common):
+  # gcc-12 toolchain + ccache-backed compile.
+  CC: /usr/bin/gcc-12
+  CXX: /usr/bin/g++-12
+  CCACHE_DIR: /home/runner/.cache/ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  # Cap the C++ parallel compile to the runner's vCPU count. The CPU build
+  # otherwise defaults MAX_JOBS high and OOMs a 4 vCPU box (see
+  # bf-build-cpu-image-from-upstream.yml).
+  MAX_JOBS: "4"
+  CARGO_BUILD_JOBS: "4"
+  # uv: CPU torch wheels + generous network timeout (Dockerfile.cpu values).
+  UV_HTTP_TIMEOUT: "500"
+  UV_INDEX_STRATEGY: unsafe-best-match
+  UV_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+  # Hugging Face download cache. Curated parser/tokenizer tests fetch small
+  # TOKENIZER files (KB-few MB, not weights) from the Hub; HF_HOME is restored
+  # across runs (Blacksmith sticky disk) so steady-state runs are a cache hit.
+  # The HF_TOKEN secret (org-level) authorizes gated repos (e.g. meta-llama).
+  # Mirrors upstream's CPU runner, which mounts ~/.cache/huggingface + HF_TOKEN
+  # (.buildkite/scripts/hardware_ci/run-cpu-test.sh).
+  HF_HOME: /home/runner/.cache/huggingface
+  HF_HUB_DOWNLOAD_TIMEOUT: "60"
+
+jobs:
+  cpu-smoke:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Cold compile of the vLLM CPU extension + Rust frontend dominates the
+    # first run; warm runs (uv/ccache/cargo cache hit) land in the ~8-10 min
+    # target. 45 min caps a cache-cold or cache-busted run well under GitHub's
+    # 360 min hard kill while leaving headroom for a from-scratch compile.
+    timeout-minutes: 45
+    steps:
+      # Third-party actions pinned by 40-char commit SHA + commented tag per
+      # the supply-chain hygiene rule (CLAUDE.md / AGENTS.md). Bump deliberately.
+      - name: Checkout PR head
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # Build needs .git present: setup.py / setuptools-scm read it for the
+          # version, and tools/check_repo.sh inspects history.
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@e92bafb6253dcd438e0484186d7669ea7a8ca1cc # v6.4.3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          # Bust the uv cache when CPU build/runtime requirements change.
+          cache-dependency-glob: |
+            requirements/cpu.txt
+            requirements/build/cpu.txt
+            requirements/common.txt
+
+      # Create a uv venv and make it the default for every later step
+      # (docker/Dockerfile.cpu does `uv venv --seed` then puts it on PATH).
+      # The runner's `/usr` Python is PEP-668 externally-managed, so a bare
+      # `uv pip install --system` is refused — install into this venv instead.
+      - name: Create build virtualenv
+        run: |
+          set -euo pipefail
+          uv venv --python "${PYTHON_VERSION}" --seed "${GITHUB_WORKSPACE}/.venv"
+          echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+
+      # ccache + cargo registry caches persist the expensive compile artifacts
+      # across runs. Keyed on the requirement/toolchain fingerprints so an
+      # upstream torch/toolchain bump starts a fresh (correct) cache lineage.
+      - name: Restore ccache
+        uses: useblacksmith/cache@c5fe29eb0efdf1cf4186b9f7fcbbcbc0cf025662 # v5.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: bf-cpu-smoke-ccache-${{ runner.os }}-${{ hashFiles('requirements/build/cpu.txt', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            bf-cpu-smoke-ccache-${{ runner.os }}-${{ hashFiles('requirements/build/cpu.txt', 'rust-toolchain.toml') }}-
+            bf-cpu-smoke-ccache-${{ runner.os }}-
+
+      - name: Restore cargo registry
+        uses: useblacksmith/cache@c5fe29eb0efdf1cf4186b9f7fcbbcbc0cf025662 # v5.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: bf-cpu-smoke-cargo-${{ runner.os }}-${{ hashFiles('rust/**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            bf-cpu-smoke-cargo-${{ runner.os }}-
+
+      # Hugging Face tokenizer cache. Keyed on this workflow file so the cache
+      # lineage resets when the curated test list (and thus the set of
+      # tokenizers fetched) changes. Restore-keys let a changed list warm-start
+      # from the previous cache instead of a cold full re-fetch.
+      - name: Restore Hugging Face cache
+        uses: useblacksmith/cache@c5fe29eb0efdf1cf4186b9f7fcbbcbc0cf025662 # v5.1.0
+        with:
+          path: ${{ env.HF_HOME }}
+          key: bf-cpu-smoke-hf-${{ runner.os }}-${{ hashFiles('.github/workflows/bf-cpu-smoke.yml') }}
+          restore-keys: |
+            bf-cpu-smoke-hf-${{ runner.os }}-
+
+      # System build deps, lifted from docker/Dockerfile.cpu (base-common):
+      # gcc-12/g++-12 toolchain, ccache, numa, tcmalloc, plus the pinned protoc
+      # the Rust frontend's build.rs needs (tools/install_protoc.sh).
+      - name: Install system build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            ccache git curl wget ca-certificates zlib1g-dev \
+            gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev jq lsof make xz-utils unzip
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-12
+          sudo PROTOC_VERSION=34.2 bash tools/install_protoc.sh
+
+      # Build the Rust frontend (`vllm-rs`) the same way Dockerfile.cpu's
+      # rust-build stage does; setup.py picks up the prebuilt binary and skips
+      # an in-tree rebuild. build_rust.sh is self-contained — it installs rustup
+      # + the pinned toolchain (rust-toolchain.toml) and `cargo build`s the
+      # vllm-rs binary. (Upstream moved off the setuptools-rust path; there is
+      # no longer a requirements/build/rust.txt to install — the previous sync
+      # removed it, which is what broke this step until this fix.)
+      - name: Build Rust frontend (vllm-rs)
+        run: |
+          set -euo pipefail
+          bash build_rust.sh
+
+      - name: CPU build + install vLLM (editable)
+        run: |
+          set -euo pipefail
+          uv pip install -r requirements/build/cpu.txt
+          # VLLM_TARGET_DEVICE=cpu is the canonical CPU build switch
+          # (docker/Dockerfile.cpu). Editable install so the curated tests
+          # import the freshly built extension.
+          VLLM_TARGET_DEVICE=cpu uv pip install -e . --no-build-isolation
+
+      - name: Import check
+        id: import
+        run: |
+          set -euo pipefail
+          VERSION="$(python -c 'import vllm; print(vllm.__version__)')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "vLLM import OK: ${VERSION}"
+
+      # Unit-test the Rust frontend crate (`vllm-rs`) at the source level. The
+      # workflow already COMPILES the crate (Build Rust frontend step) but never
+      # ran its own tests; the workspace carries a large suite incl. the Rust-
+      # native tool-parser and reasoning-parser crates. Reuse upstream's own
+      # canonical entry point (.buildkite/scripts/run-rust-frontend-cargo-ci.sh)
+      # rather than hand-rolling cargo invocations, so we track upstream's test
+      # command, feature flags, and toolchain pinning automatically on sync.
+      # The script is self-contained and idempotent: it installs protoc, the
+      # pinned toolchain, cargo-nextest, and a PyO3 Python (for the crates that
+      # bind to Python), short-circuiting each if already present — the rust
+      # toolchain and protoc are already warm from the build step above. Pure
+      # source-level tests: no model, no GPU, no network beyond tool installs.
+      - name: Run Rust crate tests (vllm-rs)
+        id: rust_tests
+        run: |
+          set -euo pipefail
+          bash .buildkite/scripts/run-rust-frontend-cargo-ci.sh test
+
+      - name: Install curated-test dependencies
+        run: |
+          set -euo pipefail
+          # The curated tests below are import/pure-Python tests, but the root
+          # tests/conftest.py is imported for any test under tests/ and pulls
+          # tblib + pytest-asyncio. vllm_test_utils backs tests/utils.py.
+          uv pip install pytest pytest-asyncio tblib
+          uv pip install -e tests/vllm_test_utils
+
+      - name: Run curated CPU-safe tests
+        id: pytest
+        env:
+          # Force the CPU platform and eager paths; never reach for a GPU.
+          VLLM_TARGET_DEVICE: cpu
+          # Curated CPU-safe set — re-verified present on main (ADR-0007).
+          # No GPU, no model download. Two layers:
+          #
+          # (a) Pure-Python / import-level tests of core data structures and
+          #     plumbing (confirmed green on this runner).
+          #
+          # (b) A compiled-CPU FUNCTIONAL test that exercises the C++/kernel
+          #     layer this workflow builds from source — the correctness signal
+          #     the pure-Python layer structurally cannot give. Sourced from
+          #     upstream's own CPU hardware-CI list
+          #     (.buildkite/hardware_tests/cpu.yaml):
+          #       - v1/sample/test_topk_topp_sampler.py: top-k/top-p SAMPLER
+          #         logic on CPU torch. Its Triton- and FlashInfer-only test
+          #         classes self-skip (HAS_TRITON / is_cuda guards), so we get
+          #         the CPU-native sampler tests without installing triton-cpu.
+          #         Confirmed pass/skip-clean on this runner.
+          #
+          # (c) Output-PARSER FUNCTIONAL tests using FAKE / MagicMock tokenizers
+          #     (files state "no real model weights required") — reasoning and
+          #     tool-call parsers, the structured-output surface our serving
+          #     stack relies on. Fully offline, no HF download.
+          #
+          # (d) PARSER tests that fetch a real TOKENIZER from the Hub. Enabled
+          #     by the org-level HF_TOKEN secret (authorizes gated repos such as
+          #     meta-llama) + the restored HF_HOME cache. These pull only small
+          #     tokenizer files, not weights, and run no inference. This is the
+          #     coverage the offline-only restriction previously had to skip.
+          #
+          # NOTE (ADR-0007 curated-set drift): the upstream sync that landed on
+          # main moved/removed two files this list used to point at
+          # (test_minimax_m3_reasoning_parser.py and test_structural_tag_registry.py);
+          # they were repointed/replaced when re-verifying against the synced main.
+          #
+          # Excluded deliberately:
+          #   - tests/test_regression.py: instantiates real LLM(...) models ->
+          #     HF download + INFERENCE, too heavy for a smoke (T1).
+          #   - tests/test_version.py: asserts the version TUPLE has 3-5 fields,
+          #     but our from-source dev build produces a 6-field dev version
+          #     (e.g. 0.23.1rc1.dev196+gc8b91b1a7 -> (0,23,1,'rc1','dev196',
+          #     'g<sha>')). The test fails on ANY dev build regardless of code
+          #     health, so it is environment-sensitive noise for a smoke gate,
+          #     not a regression signal. Dropped (ADR-0007 curated-set rule).
+          #   - tests/kernels/attention/test_cpu_attn.py: tried and dropped. On
+          #     the Blacksmith runner the CPU advertises only isa=1 (no AMX),
+          #     so ~700 of its 1294 parametrized cases hit "Unsupported CPU
+          #     attention configuration: head_dim=96 isa=1" — the kernel raises
+          #     instead of the test self-skipping, so it's runner-ISA-sensitive
+          #     noise, not a code signal (it would pass on an AMX box). It also
+          #     ran ~14 min alone, busting the smoke budget. Belongs to a
+          #     pinned-ISA tier (T2), not T0.
+          #   - model/quant/distributed/multimodal CPU tests from cpu.yaml:
+          #     they download models (`-m cpu_model`), need triton-cpu, or spawn
+          #     multiple ranks — out of the T0 budget; they belong to T1/T2.
+          # HF_TOKEN authorizes gated tokenizer repos for layer (d). Sourced
+          # from the org-level secret; absent on forks, where layer (d) tests
+          # that hit a gated repo would fail auth — acceptable, this is a
+          # private mirror and PRs come from branches, not forks.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CURATED_TESTS: >-
+            tests/test_sequence.py
+            tests/test_outputs.py
+            tests/test_logger.py
+            tests/test_envs.py
+            tests/test_scalartype.py
+            tests/transformers_utils/test_utils.py
+            tests/v1/sample/test_topk_topp_sampler.py
+            tests/reasoning/test_nemotron_v3_reasoning_parser.py
+            tests/tool_parsers/test_utils.py
+            tests/tool_parsers/test_pythonic_tool_parser.py
+            tests/tool_parsers/test_deepseekv32_tool_parser.py
+            tests/tool_parsers/test_granite_tool_parser.py
+            tests/reasoning/test_deepseekr1_reasoning_parser.py
+            tests/reasoning/test_qwen3_reasoning_parser.py
+            tests/reasoning/test_minimax_m2_reasoning_parser.py
+            tests/tool_parsers/test_hermes_tool_parser.py
+            tests/tool_parsers/test_llama3_json_tool_parser.py
+          # Per-test deselects (kept narrow — deselect the one broken case, not
+          # the whole file, so the rest of the file's coverage stays):
+          #   test_precompiled_install_flags_are_orthogonal asserts that setting
+          #   VLLM_PRECOMPILED_WHEEL_LOCATION leaves VLLM_USE_PRECOMPILED False,
+          #   but on the synced main vllm/envs.py computes VLLM_USE_PRECOMPILED
+          #   as truthy WHEN the wheel-location var is set (envs.py ~L617-619).
+          #   The test contradicts the implementation it ships with — it fails
+          #   on this commit regardless of our runner — so it is an upstream
+          #   inconsistency, not a signal about our change. Revisit on next sync.
+          DESELECTS: >-
+            tests/test_envs.py::test_precompiled_install_flags_are_orthogonal
+        run: |
+          set -euo pipefail
+          deselect_args=()
+          for t in $DESELECTS; do deselect_args+=(--deselect "$t"); done
+          # shellcheck disable=SC2086
+          python -m pytest -v -p no:cacheprovider "${deselect_args[@]}" $CURATED_TESTS
+
+      - name: Write run summary
+        if: always()
+        env:
+          VLLM_VERSION: ${{ steps.import.outputs.version }}
+          IMPORT_OUTCOME: ${{ steps.import.outcome }}
+          RUST_OUTCOME: ${{ steps.rust_tests.outcome }}
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+        run: |
+          {
+            echo "## bf-cpu-smoke (Tier-0 functional) — summary"
+            echo
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| \`import vllm\` | ${IMPORT_OUTCOME:-skipped} (version: ${VLLM_VERSION:-n/a}) |"
+            echo "| Rust crate tests (vllm-rs) | ${RUST_OUTCOME:-skipped} |"
+            echo "| curated CPU pytest | ${PYTEST_OUTCOME:-skipped} |"
+            echo
+            echo "Curated set (CPU-safe, no GPU, no inference / weights):"
+            echo "- core/plumbing: \`test_sequence test_outputs test_logger test_envs test_scalartype transformers_utils/test_utils\`"
+            echo "- compiled CPU: \`v1/sample/test_topk_topp_sampler\` (sampler)"
+            echo "- parsers (offline, mock tokenizers): reasoning \`nemotron_v3\` + tool-calling \`utils pythonic deepseekv32 granite\`"
+            echo "- parsers (HF tokenizer via HF_TOKEN + cache): reasoning \`deepseekr1 qwen3 minimax_m2\` + tool-calling \`hermes llama3_json\`"
+            echo
+            echo "Tier-0 of the ADR-0007 functional-test strategy. GPU-smoke (T1)"
+            echo "and on-demand kernel-test (T2) tiers are tracked there."
+          } >> "$GITHUB_STEP_SUMMARY"
