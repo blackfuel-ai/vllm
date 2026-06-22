@@ -183,6 +183,13 @@ jobs:
           echo "git_tag=${GIT_TAG}" >> "$GITHUB_OUTPUT"
           IMAGE_TAG="$(python -c 'import sys; sys.path.insert(0,"bf-tools"); from version import to_image_tag; print(to_image_tag(sys.argv[1]))' "$GIT_TAG")"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          # Surface the resolved (possibly auto-derived) upstream tag and the BF
+          # SemVer so the Slack card can field them without re-deriving — the
+          # workflow inputs may be blank when auto-derived.
+          {
+            echo "upstream_tag=${UPSTREAM_TAG}"
+            echo "bf_version=${BF_VERSION}"
+          } >> "$GITHUB_OUTPUT"
 
           # --- the release tag must not already exist (no clobbering a release).
           if git rev-parse -q --verify "refs/tags/${GIT_TAG}" >/dev/null; then
@@ -368,41 +375,156 @@ jobs:
         # is more important to surface than a clean one, and silent CI failure is
         # exactly what we want to avoid. Gated only on the shared bot token
         # (GitHub forbids `secrets` in a step `if:`, so read the job-level env).
-        # Branches on job.status; GIT_TAG/IMAGE_TAG may be empty if the run failed
-        # before the resolve step, so the message degrades gracefully. Same
-        # bot-token + Block Kit pattern as bf-sync-upstream and bf-build-notify.
+        # Same bot-token + Block Kit + chat.postMessage convention as
+        # bf-sync-upstream and the bf-build-notify action.
+        #
+        # The message is a structured Block Kit card mirroring ai-platform's
+        # deploy/release cards:
+        #   header  — ":rocket: bf-vllm <version> released" (success) /
+        #             ":x: bf-vllm release FAILED — <version>" (failure).
+        #   section.fields — a two-column grid of release facts (Version,
+        #             Upstream tag/commit, BF version, Channel, Image tags,
+        #             Actor, Status). Each is taken from the resolve step's
+        #             outputs; any may be empty if the run failed before resolve,
+        #             so every field degrades to "—" rather than breaking.
+        #   section  — "What's Changed": the head of the GitHub release body
+        #             (bf-tools/generate-release-notes.py output, lightly mapped
+        #             from GitHub markdown to Slack mrkdwn and truncated to the
+        #             3000-char block limit with a link out). Present only on a
+        #             successful release, where release-notes.md exists.
+        #   actions  — "View Release" + "View Run" buttons (View Run is styled
+        #             danger on failure); the release button is omitted when no
+        #             release was created.
+        #   context  — "Triggered by <actor> | <run>".
+        # jq builds the JSON so every dynamic field is escaped; --slurpfile feeds
+        # the optional changelog block array in (empty on failure).
         if: ${{ always() && env.SLACK_BOT_TOKEN != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
           GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
           IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ steps.resolve.outputs.upstream_sha }}
+          BF_VERSION: ${{ steps.resolve.outputs.bf_version }}
+          IMAGE_TARGETS: ${{ github.event.inputs.image_targets }}
           REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
           CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           payload_file="$RUNNER_TEMP/slack-payload.json"
           tag_disp="${GIT_TAG:-(unresolved)}"
+          release_url="${GITHUB_SERVER_URL}/${REPO}/releases/tag/${GIT_TAG}"
+
+          # Image-tag pull strings, one per arch target the release builds (the
+          # same GHCR repos generate-release-notes.py renders). Shown as the tags
+          # the release WILL publish — release-channel image builds are still
+          # deferred in this workflow (see the DEFERRED step above), so they are
+          # marked pending rather than claimed as pushed.
+          images_field="—"
+          if [ -n "${IMAGE_TAG:-}" ]; then
+            lines=""
+            IFS=',' read -ra targets <<< "${IMAGE_TARGETS:-nvidia,rocm,cpu,cpu-bench}"
+            for t in "${targets[@]}"; do
+              t="$(echo "$t" | tr -d '[:space:]')"
+              case "$t" in
+                nvidia)   image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm" ;;
+                rocm)     image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm" ;;
+                cpu)      image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu" ;;
+                cpu-bench) image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu-bench" ;;
+                *)        image_repo="" ;;
+              esac
+              if [ -n "$image_repo" ]; then
+                lines+="\`${image_repo}:${IMAGE_TAG}\`"$'\n'
+              fi
+            done
+            [ -n "$lines" ] && images_field="${lines%$'\n'} _(pending build)_"
+          fi
+
+          upstream_field="\`${UPSTREAM_TAG:-—}\`"
+          if [ -n "${UPSTREAM_SHA:-}" ]; then
+            upstream_field="${upstream_field} (\`${UPSTREAM_SHA:0:12}\`)"
+          fi
+
           if [ "$JOB_STATUS" = "success" ]; then
-            release_url="${GITHUB_SERVER_URL}/${REPO}/releases/tag/${GIT_TAG}"
             header=":rocket: bf-vllm ${tag_disp} released"
-            summary="Image tag \`${IMAGE_TAG:-—}\` · <${release_url}|release notes>"
             text="bf-vllm ${tag_disp} released"
           else
             header=":x: bf-vllm release FAILED — ${tag_disp}"
-            summary="The release run did not complete (status: \`${JOB_STATUS}\`). No GitHub release was created. Check the run for the failing step."
             text="bf-vllm release ${tag_disp} FAILED"
           fi
-          # jq builds valid JSON and escapes every dynamic field (tag, emoji).
-          jq -n --arg channel "$CHANNEL" --arg h "$header" --arg s "$summary" \
-            --arg text "$text" --arg run "$RUN_URL" '
+
+          # "What's Changed" block — only on a successful release, where the
+          # GitHub release body (release-notes.md) was generated above. Map the
+          # generator's GitHub markdown to Slack mrkdwn (headings -> bold,
+          # [text](url) -> <url|text>, list bullets kept) and truncate to the
+          # 3000-char block limit, linking out to the full release for the rest.
+          changelog_blocks="[]"
+          if [ "$JOB_STATUS" = "success" ] && [ -f release-notes.md ]; then
+            md="$(
+              sed -E \
+                -e 's/^#{1,6}[[:space:]]+(.*)$/*\1*/' \
+                -e 's/\[([^]]+)\]\(([^)]+)\)/<\2|\1>/g' \
+                release-notes.md
+            )"
+            limit=2800
+            if [ "${#md}" -gt "$limit" ]; then
+              md="${md:0:$limit}…"$'\n\n'"<${release_url}|View the full release on GitHub>"
+            fi
+            changelog_blocks="$(
+              jq -n --arg md "$md" \
+                '[ {type:"section",text:{type:"mrkdwn",text:("*What'"'"'s Changed*\n"+$md)}} ]'
+            )"
+          fi
+          printf '%s' "$changelog_blocks" > "$RUNNER_TEMP/changelog.json"
+
+          # Action buttons: View Release (omitted if no release was created) and
+          # View Run (danger-styled on failure, like ai-platform's failure card).
+          action_elems="$(
+            jq -n --arg run "$RUN_URL" --arg rel "$release_url" \
+              --arg status "$JOB_STATUS" --arg have_rel "${GIT_TAG:+yes}" '
+              ( if $have_rel == "yes"
+                  then [{type:"button",text:{type:"plain_text",text:"View Release",emoji:true},url:$rel}]
+                  else [] end )
+              + [ ( {type:"button",text:{type:"plain_text",text:"View Run",emoji:true},url:$run}
+                    + (if $status == "success" then {} else {style:"danger"} end) ) ]'
+          )"
+
+          jq -n \
+            --arg channel "$CHANNEL" \
+            --arg text "$text" \
+            --arg h "$header" \
+            --arg version "$tag_disp" \
+            --arg upstream "$upstream_field" \
+            --arg bf "${BF_VERSION:-—}" \
+            --arg images "$images_field" \
+            --arg actor "${ACTOR:-—}" \
+            --arg status "$JOB_STATUS" \
+            --arg run "$RUN_URL" \
+            --argjson actions "$action_elems" \
+            --slurpfile changelog "$RUNNER_TEMP/changelog.json" '
             { channel: $channel,
               text: $text,
-              blocks: [
+              blocks: ( [
                 {type:"header",text:{type:"plain_text",text:$h,emoji:true}},
-                {type:"section",text:{type:"mrkdwn",text:$s}},
-                {type:"context",elements:[{type:"mrkdwn",text:("<"+$run+"|workflow run>")}]}
-              ] }' > "$payload_file"
+                {type:"section",fields:[
+                  {type:"mrkdwn",text:("*Version:*\n`"+$version+"`")},
+                  {type:"mrkdwn",text:("*Upstream:*\n"+$upstream)},
+                  {type:"mrkdwn",text:("*BF version:*\n`"+$bf+"`")},
+                  {type:"mrkdwn",text:("*Channel:*\n`release`")},
+                  {type:"mrkdwn",text:("*Status:*\n`"+$status+"`")},
+                  {type:"mrkdwn",text:("*Actor:*\n"+$actor)},
+                  {type:"mrkdwn",text:("*Image tags:*\n"+$images)}
+                ]}
+              ]
+              + $changelog[0]
+              + [
+                {type:"actions",elements:$actions},
+                {type:"context",elements:[
+                  {type:"mrkdwn",text:("Triggered by "+$actor+" | <"+$run+"|workflow run>")}
+                ]}
+              ] ) }' > "$payload_file"
           echo "payload_file=${payload_file}" >> "$GITHUB_OUTPUT"
 
       - name: Notify Slack (optional)
