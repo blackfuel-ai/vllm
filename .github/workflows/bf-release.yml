@@ -68,12 +68,14 @@ permissions:
   contents: read
 
 env:
-  # Surfaced from the secret so the optional Slack step can gate on `env`
-  # (the `secrets` context is not allowed in a step `if:`). Empty when the
-  # secret is unset, which skips the notify step. The #bf-vllm-releases
-  # channel + webhook are a later operator prereq (mirrors the #bf-vllm-sync
-  # webhook pattern).
-  SLACK_WEBHOOK: ${{ secrets.BF_VLLM_RELEASES_SLACK_WEBHOOK }}
+  # Slack via the shared org bot token + chat.postMessage Block Kit, the same
+  # mechanism bf-sync-upstream and the bf-build-notify action use (one
+  # convention across the platform — not the old per-workflow incoming-webhook).
+  # Surfaced into env so the optional notify step can gate on it (the `secrets`
+  # context is not allowed in a step `if:`); empty when unset, which skips the
+  # step. Channel #bot-bf-vllm-releases; the bot must be a member of it.
+  SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+  SLACK_CHANNEL_ID: C0BC8MS3SP4
 
 jobs:
   release:
@@ -242,6 +244,14 @@ jobs:
           fi
           echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
 
+          # Changelog floor: the previous bf release if there is one, else the
+          # upstream tag this release is based on. For a FIRST release, falling
+          # back to the upstream tag scopes the notes to the BF layer on top of
+          # upstream (v<upstream>..main) rather than the entire vLLM history —
+          # the latter blows past GitHub's 125k-char release-body limit (422).
+          NOTES_FLOOR="${PREV_TAG:-${UPSTREAM_TAG}}"
+          echo "notes_floor=${NOTES_FLOOR}" >> "$GITHUB_OUTPUT"
+
       - name: Install lint toolchain
         run: |
           set -euo pipefail
@@ -308,24 +318,35 @@ jobs:
         id: notes
         env:
           GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
-          PREV_TAG: ${{ steps.resolve.outputs.prev_tag }}
+          # Floor = prior bf release, else the upstream base tag (first release)
+          # — never an open-ended whole-history range (would exceed GitHub's
+          # 125k-char release-body limit).
+          NOTES_FLOOR: ${{ steps.resolve.outputs.notes_floor }}
           RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
           IMAGE_TARGETS: ${{ github.event.inputs.image_targets }}
         run: |
           set -euo pipefail
-          prev_arg=()
-          if [ -n "$PREV_TAG" ]; then
-            prev_arg=(--prev-tag "$PREV_TAG")
-          fi
           # The generator lives in bf-tools/ and imports its sibling version.py
           # via a flat import, so it must run from that directory.
           ( cd bf-tools && python generate-release-notes.py \
               --version "$GIT_TAG" \
               --ref "$RELEASE_REF" \
               --image-targets "$IMAGE_TARGETS" \
-              "${prev_arg[@]}" \
+              --prev-tag "$NOTES_FLOOR" \
               --repo-dir .. ) > release-notes.md
           echo "Generated release-notes.md ($(wc -l < release-notes.md) lines)."
+
+          # Defensive: GitHub's release body hard limit is 125000 chars. The
+          # scoped range above keeps us far under it, but never let an unexpected
+          # blow-up 422 the release — truncate with a pointer to the full diff.
+          MAX=120000
+          if [ "$(wc -c < release-notes.md)" -gt "$MAX" ]; then
+            full="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${NOTES_FLOOR}...${GIT_TAG}"
+            head -c "$MAX" release-notes.md > release-notes.trunc
+            printf '\n\n_…release notes truncated; see the full diff: %s_\n' "$full" >> release-notes.trunc
+            mv release-notes.trunc release-notes.md
+            echo "::warning::Release notes exceeded ${MAX} chars; truncated with a compare link."
+          fi
 
       - name: Create the GitHub release
         env:
@@ -340,27 +361,41 @@ jobs:
             --notes-file release-notes.md \
             --verify-tag
 
-      - name: Notify #bf-vllm-releases on Slack (optional)
-        # Guarded: the #bf-vllm-releases webhook secret is a later operator
-        # prereq. When unset the step is skipped, so its absence never fails the
-        # release. GitHub forbids the `secrets` context in a step `if:`, so the
-        # secret is surfaced via the job-level SLACK_WEBHOOK env and gated on it.
-        if: ${{ env.SLACK_WEBHOOK != '' }}
+      - name: Build Slack release message
+        id: slack-msg
+        # Guarded on the shared bot token (unset on forks / before the operator
+        # wires it). GitHub forbids `secrets` in a step `if:`, so gate on the
+        # job-level SLACK_BOT_TOKEN env. Emits a Block Kit payload to a file the
+        # notify step posts — same pattern as bf-sync-upstream and bf-build-notify.
+        if: ${{ env.SLACK_BOT_TOKEN != '' }}
         env:
           GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
           IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
           REPO: ${{ github.repository }}
+          CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          payload_file="$RUNNER_TEMP/slack-payload.json"
           release_url="${GITHUB_SERVER_URL}/${REPO}/releases/tag/${GIT_TAG}"
-          text=":rocket: bf-vllm ${GIT_TAG} released (image tag \`${IMAGE_TAG}\`) — ${release_url}"
-          # Defensive: only POST to a genuine Slack webhook host, so a
-          # wrongly-configured secret can't redirect the notification elsewhere.
-          case "$SLACK_WEBHOOK" in
-            https://hooks.slack.com/*) : ;;
-            *) echo "::warning::SLACK_WEBHOOK is not a hooks.slack.com URL; skipping notify."; exit 0 ;;
-          esac
-          # jq -Rs JSON-encodes the message text (quotes, newlines, emoji).
-          curl -sf -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":$(printf '%s' "$text" | jq -Rs .)}" \
-            "$SLACK_WEBHOOK"
+          header=":rocket: bf-vllm ${GIT_TAG} released"
+          summary="Image tag \`${IMAGE_TAG}\` · <${release_url}|release notes>"
+          # jq builds valid JSON and escapes every dynamic field (tag, emoji).
+          jq -n --arg channel "$CHANNEL" --arg h "$header" --arg s "$summary" \
+            --arg text "bf-vllm ${GIT_TAG} released" --arg run "$RUN_URL" '
+            { channel: $channel,
+              text: $text,
+              blocks: [
+                {type:"header",text:{type:"plain_text",text:$h,emoji:true}},
+                {type:"section",text:{type:"mrkdwn",text:$s}},
+                {type:"context",elements:[{type:"mrkdwn",text:("<"+$run+"|workflow run>")}]}
+              ] }' > "$payload_file"
+          echo "payload_file=${payload_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack (optional)
+        if: ${{ env.SLACK_BOT_TOKEN != '' }}
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload-file-path: ${{ steps.slack-msg.outputs.payload_file }}
