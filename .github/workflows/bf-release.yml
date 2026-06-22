@@ -405,7 +405,7 @@ jobs:
               ] }' > "$payload_file"
           echo "payload_file=${payload_file}" >> "$GITHUB_OUTPUT"
 
-      - name: Notify Slack (optional)
+      - name: Notify Slack
         if: ${{ always() && env.SLACK_BOT_TOKEN != '' }}
         uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
