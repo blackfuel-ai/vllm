@@ -148,43 +148,43 @@ def test_from_image_tag_propagates_validation_error() -> None:
     "scm_describe, sha, expected",
     [
         # The canonical example: a BF release line, between-tags git-describe
-        # output. The -2-gaebd933d0 distance suffix is stripped; the literal
-        # 7-char sha is re-appended as -dev-g<sha7>; `+` becomes `_`.
+        # output. The -2-gaebd933d0 distance suffix is stripped; the bare 7-char
+        # sha is re-appended as -dev-<sha7> (no `g` prefix); `+` becomes `_`.
         (
             "v0.23.1rc0+bf.0.1.0-2-gaebd933d0",
             "aebd933d0cafef00dba5eba11",
-            "v0.23.1rc0_bf.0.1.0-dev-gaebd933",
+            "v0.23.1rc0_bf.0.1.0-dev-aebd933",
         ),
         # Build exactly at the BF tag: git-describe emits no distance suffix.
         (
             "v0.23.1rc0+bf.0.1.0",
             "aebd933d0cafef00dba5eba11",
-            "v0.23.1rc0_bf.0.1.0-dev-gaebd933",
+            "v0.23.1rc0_bf.0.1.0-dev-aebd933",
         ),
         # Already `_`-sanitised input round-trips unchanged through the helper.
         (
             "v0.23.1rc0_bf.0.1.0-2-gaebd933d0",
             "aebd933d0cafef00dba5eba11",
-            "v0.23.1rc0_bf.0.1.0-dev-gaebd933",
+            "v0.23.1rc0_bf.0.1.0-dev-aebd933",
         ),
         # Upstream-fallback line (no BF release reachable): no `+`, leading `v`
         # preserved, distance suffix stripped just the same.
         (
             "v0.23.1rc0-5-gdeadbeef0",
             "deadbeef0cafef00dba5eba11",
-            "v0.23.1rc0-dev-gdeadbee",
+            "v0.23.1rc0-dev-deadbee",
         ),
         # Final (non-rc) upstream half.
         (
             "v0.20.2+bf.0.1.0-11-gd30cceb56",
             "d30cceb561234567890abcdef",
-            "v0.20.2_bf.0.1.0-dev-gd30cceb",
+            "v0.20.2_bf.0.1.0-dev-d30cceb",
         ),
     ],
 )
 def test_dev_image_tag(scm_describe: str, sha: str, expected: str) -> None:
     """dev_image_tag strips git-describe distance, sanitises `+`, and appends
-    the 7-char commit marker."""
+    the bare 7-char commit marker."""
     assert dev_image_tag(scm_describe, sha) == expected
 
 
@@ -192,13 +192,14 @@ def test_dev_image_tag_uses_underscore_not_plus() -> None:
     """The `+` of the BF release separator never survives into an image tag."""
     tag = dev_image_tag("v0.23.1rc0+bf.0.1.1-2-gaebd933d0", "aebd933d0cafef00d")
     assert "+" not in tag
-    assert tag == "v0.23.1rc0_bf.0.1.1-dev-gaebd933"
+    assert tag == "v0.23.1rc0_bf.0.1.1-dev-aebd933"
 
 
 def test_dev_image_tag_takes_exactly_seven_sha_chars() -> None:
-    """The marker is `g` + the first 7 sha chars regardless of input length."""
+    """The marker is the first 7 sha chars (bare, no `g`) regardless of input
+    length."""
     tag = dev_image_tag("v0.20.2+bf.0.1.0", "0123456789abcdef")
-    assert tag.endswith("-dev-g0123456")
+    assert tag.endswith("-dev-0123456")
 
 
 def test_dev_image_tag_rejects_short_sha() -> None:
@@ -225,9 +226,9 @@ def test_dev_image_tag_rejects_non_hex_sha(bad_sha: str) -> None:
 @pytest.mark.parametrize(
     "tag, base, sha7",
     [
-        ("v0.23.1rc0_bf.0.1.0-dev-gaebd933", "v0.23.1rc0_bf.0.1.0", "aebd933"),
-        ("v0.20.2_bf.0.1.0-dev-gd30cceb", "v0.20.2_bf.0.1.0", "d30cceb"),
-        ("v0.23.1rc0-dev-gdeadbee", "v0.23.1rc0", "deadbee"),
+        ("v0.23.1rc0_bf.0.1.0-dev-aebd933", "v0.23.1rc0_bf.0.1.0", "aebd933"),
+        ("v0.20.2_bf.0.1.0-dev-d30cceb", "v0.20.2_bf.0.1.0", "d30cceb"),
+        ("v0.23.1rc0-dev-deadbee", "v0.23.1rc0", "deadbee"),
     ],
 )
 def test_parse_dev_image_tag(tag: str, base: str, sha7: str) -> None:
@@ -246,17 +247,19 @@ def test_dev_image_tag_round_trip() -> None:
 
 _INVALID_DEV_IMAGE_TAGS = [
     # No -dev- marker at all.
-    "v0.23.1rc0_bf.0.1.0-gaebd933",
+    "v0.23.1rc0_bf.0.1.0-aebd933",
     # Trailing -dev (the OLD format this PR replaces) is no longer valid.
     "v0.23.1rc0_bf.0.1.0-2-gaebd933d0-dev",
     # sha7 too short (6 chars).
-    "v0.23.1rc0_bf.0.1.0-dev-gaebd93",
+    "v0.23.1rc0_bf.0.1.0-dev-aebd93",
     # sha7 too long (8 chars).
-    "v0.23.1rc0_bf.0.1.0-dev-gaebd9333",
-    # Missing the `g` prefix on the sha.
-    "v0.23.1rc0_bf.0.1.0-dev-aebd933",
+    "v0.23.1rc0_bf.0.1.0-dev-aebd9333",
+    # A `g` prefix is now disallowed: `gaebd93` is 7 chars but `g` isn't hex.
+    "v0.23.1rc0_bf.0.1.0-dev-gaebd93",
     # Non-hex in the sha.
-    "v0.23.1rc0_bf.0.1.0-dev-gzzzzzzz",
+    "v0.23.1rc0_bf.0.1.0-dev-zzzzzzz",
+    # Uppercase hex (git emits lowercase).
+    "v0.23.1rc0_bf.0.1.0-dev-AEBD933",
     # Empty string.
     "",
 ]

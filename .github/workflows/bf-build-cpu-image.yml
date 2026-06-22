@@ -13,12 +13,12 @@
 #   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
 #                     Pushed to the shared repository, label-routed and never
 #                     auto-deployed:
-#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu:<base-version>-dev-g<sha7>
-#                     e.g. …/vllm-cpu:v0.23.1rc0_bf.0.1.0-dev-gaebd933. The tag
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu:<base-version>-dev-<sha7>
+#                     e.g. …/vllm-cpu:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
 #                     embeds the clean base version (not a bare sha) because the
 #                     engine renders the image tag verbatim — a bare sha would
 #                     read as "no version" on the deployment page. The trailing
-#                     g<sha7> marker carries the commit, so a manual dev build is
+#                     <sha7> marker carries the commit, so a manual dev build is
 #                     uniquely identified without a PR number; the per-PR
 #                     :dev-pr-<N> form (ADR-0004) arrives with the PR-triggered
 #                     build wiring, not this manual dispatch.
@@ -143,7 +143,7 @@ jobs:
                   || git describe --tags --match 'v[0-9]*' HEAD)"
           scm_version="${scm_raw//+/_}"
 
-          # dev_image_tag: the dev-channel tag <base-version>-dev-g<sha7>, the
+          # dev_image_tag: the dev-channel tag <base-version>-dev-<sha7>, the
           # clean base scm version (git-describe distance suffix stripped) plus
           # the literal commit. Built by the single source of truth
           # (bf-tools/version.py) so the format lives in one place. Only the dev
@@ -220,9 +220,9 @@ jobs:
           #   upstream — bare, vLLM-identical in the dedicated upstream repo:
           #     :sha-<short> always; :vX.Y.Z on an upstream release tag;
           #     :latest only for upstream-main (no other ref may clobber it).
-          #   dev — <base-version>-dev-g<sha7> (e.g. v0.23.1rc0_bf.0.1.0-dev-
-          #     gaebd933). The base version (not a bare sha) is what the engine
-          #     shows verbatim on the deployment page; the g<sha7> marker keeps
+          #   dev — <base-version>-dev-<sha7> (e.g. v0.23.1rc0_bf.0.1.0-dev-
+          #     aebd933). The base version (not a bare sha) is what the engine
+          #     shows verbatim on the deployment page; the <sha7> marker keeps
           #     it unique per commit.
           #   release — the immutable release version + the two moving aliases
           #     (<upstream>_bf-latest, bf-stable) that engine pinning/promotion
