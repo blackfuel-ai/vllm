@@ -1,0 +1,366 @@
+# bf-vllm release orchestration (manual, workflow_dispatch only).
+#
+# Cuts a Blackfuel release per ADR-0004: a single canonical version
+#   v<upstream-semver>+bf.<bf-semver>   (e.g. v0.20.2+bf.0.1.0)
+# tagged on `main`, with a matching GitHub release and (in a later PR) the
+# `release`-channel arch images on GHCR.
+#
+# Release model (ADR-0002 §Decision): we tag `main` DIRECTLY. Release
+# branches are OPTIONAL — created only for hotfix isolation of an old
+# upstream line (`release/v<upstream>+bf.<bf>.x`), NOT on the normal release
+# path. `main` is never force-pushed, so tags on it are stable forever; there
+# is no rebase, no `bf/patches` branch, no upstream-tag + BF-layer re-merge.
+# (The master plan §8c was written in an earlier rebase-era design and
+# describes building a release branch by merging the BF layer onto the
+# upstream tag; ADR-0002's merge model supersedes that — `main` already IS
+# upstream-merged + the BF layer, so we tag the chosen point on `main`.)
+#
+# What this workflow does:
+#   1. Validate inputs — bf_version shape via bf-tools/version.py; resolve
+#      upstream_tag -> SHA and confirm it is an ancestor of upstream-main;
+#      confirm bf_version is a legal increment over the latest release; confirm
+#      the upstream tag commit is reachable from the release ref on main.
+#   2. Resolve the release ref on `main` (default: current main HEAD).
+#   3. Run the curated CI (the bf-precommit suite) on the release ref.
+#   4. [TODO] Dispatch the per-arch `release`-channel image builds. DEFERRED:
+#      those become thin callers of the consolidated reusable build core
+#      (bf-build-image.yml), which does not exist yet. See the step below.
+#   5. Create the annotated git tag v<upstream>+bf.<bf> (via version.py) and
+#      push it with the bf-vllm-sync App token.
+#   6. Generate the release notes (bf-tools/generate-release-notes.py) and
+#      create the GitHub release pointing at the tag.
+#   7. Notify #bf-vllm-releases on Slack (guarded — the webhook is a later
+#      operator prereq; the step is skipped while the secret is unset).
+#
+# A real run creates a real git tag and a real GitHub release. It is an
+# operator-gated action; do not dispatch it as part of CI.
+
+name: bf-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream vLLM tag this release is based on (e.g. v0.23.1 or v0.23.1rc0). Leave blank to auto-derive the newest release tag reachable from the release ref. Override only to pin a specific base."
+        type: string
+        required: false
+        default: ""
+      bf_version:
+        description: "Blackfuel layer SemVer (e.g. 0.1.0). Leave blank to auto-suggest the next patch over the latest release on this line (or 0.1.0 for the first). Set explicitly for a minor/major bump."
+        type: string
+        required: false
+        default: ""
+      image_targets:
+        description: "Comma-separated arch image targets for the release-channel builds."
+        type: string
+        required: false
+        default: nvidia,rocm,cpu,cpu-bench
+
+# Only one release in flight at a time; never cancel a release mid-tag.
+concurrency:
+  group: bf-release
+  cancel-in-progress: false
+
+# Default GITHUB_TOKEN is read-only here: the tag push and release creation
+# use the separately-minted bf-vllm-sync App token (whose access is governed
+# by the App installation), mirroring bf-sync-upstream.
+permissions:
+  contents: read
+
+env:
+  # Surfaced from the secret so the optional Slack step can gate on `env`
+  # (the `secrets` context is not allowed in a step `if:`). Empty when the
+  # secret is unset, which skips the notify step. The #bf-vllm-releases
+  # channel + webhook are a later operator prereq (mirrors the #bf-vllm-sync
+  # webhook pattern).
+  SLACK_WEBHOOK: ${{ secrets.BF_VLLM_RELEASES_SLACK_WEBHOOK }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mint bf-vllm-sync App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # client-id is the non-deprecated identifier (app-id is deprecated).
+          # The bf-vllm-sync App's Client ID; its installation governs the
+          # effective push/release access.
+          client-id: Iv23liG4vLDpTNkt8CLs
+          private-key: ${{ secrets.BF_VLLM_SYNC_PRIVATE_KEY }}
+
+      - name: Checkout main (full history + tags)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          # The release tag push uses the App token, so persist it as the
+          # checkout credential.
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure git identity (bf-vllm-sync bot)
+        env:
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Set up Python
+        # v6.1.0 matches bf-precommit.yml and has 3.14 in its version manifest;
+        # allow-prereleases keeps the resolve robust if only a 3.14 RC is indexed
+        # on the runner image.
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
+
+      - name: Validate inputs and resolve the release version
+        id: resolve
+        env:
+          UPSTREAM_TAG: ${{ github.event.inputs.upstream_tag }}
+          BF_VERSION: ${{ github.event.inputs.bf_version }}
+        run: |
+          set -euo pipefail
+
+          # --- fetch the upstream-main mirror so ancestry checks are local.
+          git fetch origin upstream-main:upstream-main
+          git fetch --tags origin
+
+          RELEASE_REF="$(git rev-parse main)"
+
+          # --- auto-derive upstream_tag when blank: the newest release tag
+          # (vX.Y.Z[rcN]) reachable from the release ref. main's upstream layer
+          # IS a release tag by construction (ADR-0002 tag-gated merge), so this
+          # is exactly the upstream this release is based on. An rc is allowed
+          # here: the bf-release path may deliberately release the temporary rc
+          # main currently sits on. (The bf-sync-upstream automation stays
+          # finals-only — it will not auto-track rc's; only a human release may.)
+          if [ -z "${UPSTREAM_TAG}" ]; then
+            UPSTREAM_TAG="$(
+              git tag --list 'v*' --merged "$RELEASE_REF" \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$' \
+                | sort -V | tail -n1
+            )"
+            if [ -z "${UPSTREAM_TAG}" ]; then
+              echo "::error::Could not auto-derive an upstream tag reachable from main. Pass upstream_tag explicitly."
+              exit 1
+            fi
+            echo "Auto-derived upstream_tag=${UPSTREAM_TAG} (newest release tag reachable from main)."
+          fi
+
+          # --- auto-suggest bf_version when blank: next PATCH over the latest
+          # release on this upstream line, or 0.1.0 for the first release. The
+          # operator sets it explicitly for a minor/major bump.
+          if [ -z "${BF_VERSION}" ]; then
+            LATEST_BF_TAG="$(git tag --list "${UPSTREAM_TAG}+bf.*" | sort -V | tail -n1)"
+            if [ -z "${LATEST_BF_TAG}" ]; then
+              BF_VERSION="0.1.0"
+            else
+              BF_VERSION="$(python -c '
+          import sys; sys.path.insert(0, "bf-tools")
+          from version import parse_git_tag
+          maj, minr, pat = (int(x) for x in parse_git_tag(sys.argv[1]).bf.split("."))
+          print(f"{maj}.{minr}.{pat + 1}")' "$LATEST_BF_TAG")"
+            fi
+            echo "Auto-suggested bf_version=${BF_VERSION} (next patch; set explicitly for minor/major)."
+          fi
+
+          # --- compute the canonical git tag and validate its SHAPE through the
+          # single source of truth (bf-tools/version.py). A malformed bf_version
+          # (or upstream_tag missing its leading v) fails here, loudly.
+          GIT_TAG="${UPSTREAM_TAG}+bf.${BF_VERSION}"
+          python - "$GIT_TAG" <<'PY'
+          import sys
+          sys.path.insert(0, "bf-tools")
+          from version import parse_git_tag
+          v = parse_git_tag(sys.argv[1])
+          print(f"validated {v.git_tag} -> image {v.image_tag}")
+          PY
+          echo "git_tag=${GIT_TAG}" >> "$GITHUB_OUTPUT"
+          IMAGE_TAG="$(python -c 'import sys; sys.path.insert(0,"bf-tools"); from version import to_image_tag; print(to_image_tag(sys.argv[1]))' "$GIT_TAG")"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+          # --- the release tag must not already exist (no clobbering a release).
+          if git rev-parse -q --verify "refs/tags/${GIT_TAG}" >/dev/null; then
+            echo "::error::Tag ${GIT_TAG} already exists — releases are immutable."
+            exit 1
+          fi
+
+          # --- resolve upstream_tag -> SHA and confirm it is an ancestor of
+          # upstream-main (i.e. a tag genuinely mirrored on our upstream line).
+          if ! git rev-parse -q --verify "refs/tags/${UPSTREAM_TAG}^{commit}" >/dev/null; then
+            echo "::error::Upstream tag ${UPSTREAM_TAG} is not present. Has the sync mirrored it onto upstream-main yet?"
+            exit 1
+          fi
+          UPSTREAM_SHA="$(git rev-parse "refs/tags/${UPSTREAM_TAG}^{commit}")"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          if ! git merge-base --is-ancestor "$UPSTREAM_SHA" upstream-main; then
+            echo "::error::${UPSTREAM_TAG} ($UPSTREAM_SHA) is not an ancestor of upstream-main."
+            exit 1
+          fi
+
+          # --- the release point on main must already contain that upstream tag
+          # (the daily sync merges upstream-main into main; ADR-0002). If main
+          # has not yet synced past this upstream tag, the BF release would not
+          # actually contain it — fail rather than tag a misleading version.
+          # RELEASE_REF was resolved above (main HEAD) before input derivation.
+          echo "release_ref=${RELEASE_REF}" >> "$GITHUB_OUTPUT"
+          if ! git merge-base --is-ancestor "$UPSTREAM_SHA" "$RELEASE_REF"; then
+            echo "::error::main ($RELEASE_REF) has not yet merged upstream ${UPSTREAM_TAG}. Run the sync first."
+            exit 1
+          fi
+
+          # --- bf_version must be a legal increment over the latest release on
+          # this upstream line. "Latest" = highest bf semver among tags
+          # v<upstream_tag>+bf.* (independent per upstream line, ADR-0004). The
+          # new bf_version must sort strictly greater; the first release on a
+          # line has no predecessor and is always legal.
+          PREV_TAG="$(
+            git tag --list "${UPSTREAM_TAG}+bf.*" \
+              | sort -V | tail -n1
+          )"
+          if [ -n "$PREV_TAG" ]; then
+            python - "$PREV_TAG" "$GIT_TAG" <<'PY'
+          import sys
+          sys.path.insert(0, "bf-tools")
+          from version import parse_git_tag
+
+          prev = parse_git_tag(sys.argv[1])
+          new = parse_git_tag(sys.argv[2])
+          to_t = lambda s: tuple(int(x) for x in s.split("."))
+          if to_t(new.bf) <= to_t(prev.bf):
+              sys.exit(
+                  f"bf_version {new.bf} is not a strict increment over "
+                  f"the latest release {prev.git_tag} (bf {prev.bf})."
+              )
+          print(f"bf {new.bf} is a legal increment over {prev.bf}")
+          PY
+          else
+            echo "No prior release on the ${UPSTREAM_TAG} line — first release, accepted."
+          fi
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Install lint toolchain
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements/lint.txt
+
+      - name: Run curated CI on the release ref
+        # The bf-precommit suite is the curated lint gate (ADR-0005). It runs
+        # against the checked-out release ref (main HEAD).
+        run: |
+          set -euo pipefail
+          pre-commit run --all-files --hook-stage manual
+
+      - name: "[TODO] Dispatch release-channel image builds (DEFERRED)"
+        env:
+          GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
+          IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
+          IMAGE_TARGETS: ${{ github.event.inputs.image_targets }}
+          RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
+        run: |
+          set -euo pipefail
+          # ----------------------------------------------------------------
+          # TODO(consolidation): dispatch the per-arch RELEASE-channel image
+          # builds here once the reusable build core exists.
+          #
+          # These builds are intentionally NOT implemented in this PR. They
+          # must become thin callers of a single consolidated reusable
+          # workflow (bf-build-image.yml) — the "build consolidation"
+          # workstream queued after build validation. Writing release build
+          # steps now would be a 5th/6th copy of the build mechanics right
+          # before that consolidation, so they are deferred.
+          #
+          # When wired, this step dispatches one build per IMAGE_TARGETS entry
+          # (default: nvidia,rocm,cpu,cpu-bench), each building from
+          # RELEASE_REF and publishing the `release` channel per ADR-0004:
+          #   - immutable tag:  ${IMAGE_TAG}              (e.g. 0.20.2_bf.0.1.0)
+          #   - moving tag:     <upstream>_bf-latest      (newest BF release on the line)
+          #   - moving tag:     bf-stable                 (moved by engine after bake)
+          #   OCI labels: ai.bf-vllm.build.channel=release,
+          #               ai.bf-vllm.bf.version=<bf semver>,
+          #               ai.bf-vllm.image.tag=${IMAGE_TAG}, plus the standard
+          #               org.opencontainers.image.* / ai.vllm.* set (ADR-0004 §8b).
+          # The future callers (bf-build-{nvidia,rocm,cpu,cpu-bench}-image.yml,
+          # release channel) are dispatched via:
+          #   gh workflow run bf-build-<arch>-image.yml --ref main \
+          #     -f channel=release -f release_ref="$RELEASE_REF" \
+          #     -f git_tag="$GIT_TAG"
+          # ----------------------------------------------------------------
+          echo "::notice::Release-channel image builds for ${GIT_TAG} (targets: ${IMAGE_TARGETS}) are DEFERRED to the build-consolidation PR — no images built by this run."
+
+      - name: Create and push the annotated release tag
+        id: tag
+        env:
+          GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
+          RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
+          UPSTREAM_TAG: ${{ github.event.inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          git tag -a "$GIT_TAG" "$RELEASE_REF" \
+            -m "bf-vllm release ${GIT_TAG} (upstream ${UPSTREAM_TAG})"
+          git push origin "refs/tags/${GIT_TAG}"
+
+      - name: Generate release notes
+        id: notes
+        env:
+          GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
+          PREV_TAG: ${{ steps.resolve.outputs.prev_tag }}
+          RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
+          IMAGE_TARGETS: ${{ github.event.inputs.image_targets }}
+        run: |
+          set -euo pipefail
+          prev_arg=()
+          if [ -n "$PREV_TAG" ]; then
+            prev_arg=(--prev-tag "$PREV_TAG")
+          fi
+          # The generator lives in bf-tools/ and imports its sibling version.py
+          # via a flat import, so it must run from that directory.
+          ( cd bf-tools && python generate-release-notes.py \
+              --version "$GIT_TAG" \
+              --ref "$RELEASE_REF" \
+              --image-targets "$IMAGE_TARGETS" \
+              "${prev_arg[@]}" \
+              --repo-dir .. ) > release-notes.md
+          echo "Generated release-notes.md ($(wc -l < release-notes.md) lines)."
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$GIT_TAG" \
+            --repo "$REPO" \
+            --title "bf-vllm $GIT_TAG" \
+            --notes-file release-notes.md \
+            --verify-tag
+
+      - name: Notify #bf-vllm-releases on Slack (optional)
+        # Guarded: the #bf-vllm-releases webhook secret is a later operator
+        # prereq. When unset the step is skipped, so its absence never fails the
+        # release. GitHub forbids the `secrets` context in a step `if:`, so the
+        # secret is surfaced via the job-level SLACK_WEBHOOK env and gated on it.
+        if: ${{ env.SLACK_WEBHOOK != '' }}
+        env:
+          GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
+          IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          release_url="${GITHUB_SERVER_URL}/${REPO}/releases/tag/${GIT_TAG}"
+          text=":rocket: bf-vllm ${GIT_TAG} released (image tag \`${IMAGE_TAG}\`) — ${release_url}"
+          # Defensive: only POST to a genuine Slack webhook host, so a
+          # wrongly-configured secret can't redirect the notification elsewhere.
+          case "$SLACK_WEBHOOK" in
+            https://hooks.slack.com/*) : ;;
+            *) echo "::warning::SLACK_WEBHOOK is not a hooks.slack.com URL; skipping notify."; exit 0 ;;
+          esac
+          # jq -Rs JSON-encodes the message text (quotes, newlines, emoji).
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":$(printf '%s' "$text" | jq -Rs .)}" \
+            "$SLACK_WEBHOOK"
