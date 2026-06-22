@@ -1,0 +1,326 @@
+# Manually-triggered NVIDIA/CUDA image build, channel-aware (ADR-0004). One
+# workflow serves all three build channels; the `channel` input selects the
+# registry repository, tag scheme, OCI labels, and what source gets built:
+#
+#   channel=upstream  bare upstream vLLM at `ref`, no Blackfuel layer. The CUDA
+#                     Dockerfile ingests the vLLM *source* as its build context
+#                     (COPY . ./), so we check upstream source into src/ and
+#                     overlay BF's docker/Dockerfile from the calling ref on top
+#                     — the compiled image carries the BF Dockerfile (local-disk
+#                     sccache [bf-patch], arch-trim) while the vLLM source stays
+#                     bare upstream. Pushed to the dedicated upstream repository
+#                     whose PATH is the channel signal (engine routes by repo,
+#                     not label):
+#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-nvidia:sha-<short>
+#                       …:vX.Y.Z   (upstream release tags only)
+#                       …:latest   (upstream-main only)
+#   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
+#                     The tree already carries BF's docker/Dockerfile AND the
+#                     BF-layered source, so it is checked into src/ as-is with NO
+#                     overlay. Pushed to the shared repository, label-routed and
+#                     never auto-deployed:
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-nvidia:<scm-version>-dev
+#                     The tag embeds the scm-describe version (not a bare sha)
+#                     because the engine renders the image tag verbatim — a bare
+#                     sha would read as "no version" on the deployment page.
+#   channel=release   the bf-vllm tree at the release ref, tagged with the
+#                     canonical release version. Orchestrated by bf-release.yml,
+#                     which passes `git_tag`; this workflow only builds + pushes.
+#                       …/vllm-nvidia:<upstream>_bf.<bf>  (immutable release)
+#                       …/vllm-nvidia:<upstream>_bf-latest
+#                       …/vllm-nvidia:bf-stable
+#
+# Caching (ADR-0005 amendment): sccache runs in local-disk mode, writing into
+# /sccache inside the build. That path is a BuildKit `type=cache` mount (id
+# vllm-nvidia-sccache) declared in docker/Dockerfile, and the Blacksmith Docker
+# builder persists BuildKit cache mounts across runs automatically — so warm
+# builds reuse compiled object output. No S3, no external bucket: the cache
+# mount IS the persistence layer, selected by USE_SCCACHE=1 with an empty
+# SCCACHE_BUCKET_NAME (see the [bf-patch] "enable local-disk sccache via
+# BuildKit cache mount").
+#
+# VLLM_USE_PRECOMPILED is intentionally left OFF here. Precompiled wheels speed
+# up Python-only changes by skipping the C++/CUDA compile, but these builds
+# track moving refs where the wheel would frequently be stale and trigger a full
+# recompile anyway. sccache gives the speedup instead — it caches at the
+# compiler-invocation level. Do not flip VLLM_USE_PRECOMPILED on without
+# re-reading ADR-0005.
+
+name: bf-build-nvidia-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Build channel (ADR-0004): upstream (bare upstream), dev (bf-vllm tree, preview), release (bf-vllm tree at a release tag)."
+        type: choice
+        required: true
+        default: upstream
+        options:
+          - upstream
+          - dev
+          - release
+      ref:
+        description: "Source ref to build. upstream: a vLLM ref (branch/tag/SHA) or upstream-main. dev/release: a bf-vllm ref (branch/SHA/tag)."
+        type: string
+        required: true
+        default: upstream-main
+      git_tag:
+        description: "Release git tag (release channel only), e.g. v0.23.1rc0+bf.0.1.0. Mapped to the OCI image tag via bf-tools/version.py."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: bf-build-nvidia-${{ github.event.inputs.channel }}-${{ github.event.inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # 32 vCPU + 360 min cap, sized for the first COLD build (empty sccache, no
+    # hits until one build completes to warm /sccache). The cold compile is
+    # ~417 CUDA objects; the heavy vllm-flash-attn SM90 kernels run ~49s each
+    # even on 16 vCPU, so a cold 16-vCPU build still exceeds the 300 min cap (8
+    # vCPU reached 91%, 16 vCPU ~66% at 3h then projected to time out). 32 vCPU
+    # roughly halves the compile wall-clock and 360 (GitHub's max) leaves
+    # headroom for link + wheel finalize + the multi-GB image push. Once this
+    # build warms /sccache, warm builds hit the ADR-0005 ~25 min target and the
+    # runner can be dropped back; 32 vCPU is the one-time warm-up cost.
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 360
+    steps:
+      - name: Record build start time
+        id: started
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      # The CUDA Dockerfile ingests the vLLM source as its build context
+      # (COPY . ./), so the build context is whatever source we check into src/.
+      # For the upstream channel that is bare upstream vLLM at `ref`; for
+      # dev/release it is the bf-vllm tree at `ref` (which already carries the BF
+      # layer and BF's docker/Dockerfile). fetch-depth: 0 + tags so the dev
+      # channel can `git describe` the tree to derive a human-readable version.
+      - name: Checkout source at ref (build context)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 0
+          path: src
+
+      - name: Resolve channel, image repository, and provenance
+        id: prov
+        env:
+          CHANNEL: ${{ github.event.inputs.channel }}
+          REF: ${{ github.event.inputs.ref }}
+          GIT_TAG: ${{ github.event.inputs.git_tag }}
+          OWNER_IMAGE: ghcr.io/blackfuel-ai/bf-vllm
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short="${sha:0:7}"
+
+          # version: the bare vLLM-identical name for the upstream channel, set
+          # only when the built ref is an upstream release tag (vX.Y.Z[rcN]); a
+          # between-tags upstream build leaves it empty (sha pin + :latest only).
+          if printf '%s' "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'; then
+            version="$REF"
+          else
+            version=""
+          fi
+
+          case "$CHANNEL" in
+            upstream)
+              # Dedicated upstream repository: the path is the channel signal
+              # (ADR-0004 amendment), so tags stay bare and vLLM-identical.
+              image="${OWNER_IMAGE}/upstream/vllm-nvidia"
+              ;;
+            dev|release)
+              # Shared repository, label-routed (ADR-0004).
+              image="${OWNER_IMAGE}/vllm-nvidia"
+              ;;
+            *)
+              echo "::error::Unknown channel '${CHANNEL}'." >&2
+              exit 1
+              ;;
+          esac
+
+          # scm_version: the bf-vllm tree's self-description, the way vLLM names
+          # its own dev builds (git describe / setuptools-scm). Prefer the BF
+          # release line (v<upstream>+bf.<bf>); fall back to the upstream tag
+          # line when no BF release is reachable. `+` -> `_` for OCI. Never
+          # fails: the upstream fallback always resolves on this mirror.
+          scm_raw="$(git -C src describe --tags --match 'v*+bf.*' HEAD 2>/dev/null \
+                  || git -C src describe --tags --match 'v[0-9]*' HEAD)"
+          scm_version="${scm_raw//+/_}"
+
+          # bf_image_tag / bf_version / bf_upstream: the canonical release
+          # identity, derived from git_tag via the single source of truth
+          # (bf-tools/version.py). Only consumed by the release channel;
+          # validated here so a malformed git_tag fails before the build.
+          bf_image_tag=""
+          bf_version=""
+          bf_upstream=""
+          if [ "$CHANNEL" = "release" ]; then
+            if [ -z "$GIT_TAG" ]; then
+              echo "::error::channel=release requires git_tag (e.g. v0.23.1rc0+bf.0.1.0)." >&2
+              exit 1
+            fi
+            read -r bf_image_tag bf_version bf_upstream < <(python - "$GIT_TAG" <<'PY'
+          import sys
+          sys.path.insert(0, "src/bf-tools")
+          from version import parse_git_tag
+          v = parse_git_tag(sys.argv[1])
+          print(v.image_tag, v.bf, v.upstream)
+          PY
+          )
+          fi
+
+          {
+            echo "channel=${CHANNEL}"
+            echo "image=${image}"
+            echo "sha=${sha}"
+            echo "short=${short}"
+            echo "version=${version}"
+            echo "scm_version=${scm_version}"
+            echo "bf_image_tag=${bf_image_tag}"
+            echo "bf_version=${bf_version}"
+            echo "bf_upstream=${bf_upstream}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Upstream channel only: overlay BF's docker/Dockerfile from the calling
+      # ref (github.ref_name) onto the bare upstream source in src/, so the build
+      # uses the BF Dockerfile (sccache [bf-patch], arch-trim) while the vLLM
+      # source stays bare upstream. dev/release skip this — their src/ checkout
+      # is the bf-vllm tree, which already carries BF's docker/Dockerfile.
+      - name: Overlay BF docker/Dockerfile from the calling ref
+        if: ${{ steps.prov.outputs.channel == 'upstream' }}
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.ref_name }}
+          path: bf
+          sparse-checkout: docker/Dockerfile
+          sparse-checkout-cone-mode: false
+
+      - name: Stage overlaid Dockerfile into the upstream context
+        if: ${{ steps.prov.outputs.channel == 'upstream' }}
+        run: cp bf/docker/Dockerfile src/docker/Dockerfile
+
+      # The build context in src/ is bare upstream vLLM source (upstream channel)
+      # or the bf-vllm tree (dev/release); either way the bf-build-notify
+      # composite action is not reliably at the workspace root. Sparse-checkout
+      # just .github/actions from the calling bf-vllm ref into bf-actions/ so
+      # `uses: ./bf-actions/...` below resolves — the path all four builds use.
+      - name: Checkout BF composite actions from the calling ref
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.ref_name }}
+          path: bf-actions
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
+        with:
+          images: ${{ steps.prov.outputs.image }}
+          # Tag scheme per channel (ADR-0004):
+          #   upstream — bare, vLLM-identical in the dedicated upstream repo:
+          #     :sha-<short> always; :vX.Y.Z on an upstream release tag;
+          #     :latest only for upstream-main (no other ref may clobber it).
+          #   dev — the scm-describe version + a -dev marker; the version (not a
+          #     bare sha) is what the engine shows verbatim, and the embedded
+          #     g<sha> keeps it unique per commit.
+          #   release — the immutable release version + the two moving aliases
+          #     (<upstream>_bf-latest, bf-stable) for engine pinning/promotion.
+          tags: |
+            type=raw,value=sha-${{ steps.prov.outputs.short }},enable=${{ steps.prov.outputs.channel == 'upstream' }}
+            type=raw,value=${{ steps.prov.outputs.version }},enable=${{ steps.prov.outputs.channel == 'upstream' && steps.prov.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ steps.prov.outputs.channel == 'upstream' && github.event.inputs.ref == 'upstream-main' }}
+            type=raw,value=${{ steps.prov.outputs.scm_version }}-dev,enable=${{ steps.prov.outputs.channel == 'dev' }}
+            type=raw,value=${{ steps.prov.outputs.bf_image_tag }},enable=${{ steps.prov.outputs.channel == 'release' }}
+            type=raw,value=${{ steps.prov.outputs.bf_upstream }}_bf-latest,enable=${{ steps.prov.outputs.channel == 'release' }}
+            type=raw,value=bf-stable,enable=${{ steps.prov.outputs.channel == 'release' }}
+          # image.revision / ai.bf-vllm.build.commit = the bf-vllm workflow
+          # commit (github.sha); ai.vllm.build.commit = the source commit
+          # actually built (upstream vLLM for upstream; the bf-vllm tree for
+          # dev/release). ai.bf-vllm.build.channel is descriptive on upstream
+          # (routing is by repo path) and the routing input on dev/release.
+          # ai.bf-vllm.bf.version is set on release only; ai.bf-vllm.scm.version
+          # records the tree's describe-version for agents (get_image_labels).
+          labels: |
+            org.opencontainers.image.source=https://github.com/blackfuel-ai/bf-vllm
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            org.opencontainers.image.title=vLLM (Blackfuel, Nvidia)
+            org.opencontainers.image.vendor=Blackfuel
+            org.opencontainers.image.version=${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.version || steps.prov.outputs.scm_version) }}
+            ai.vllm.image.tag=${{ steps.prov.outputs.version }}
+            ai.vllm.build.commit=${{ steps.prov.outputs.sha }}
+            ai.bf-vllm.build.commit=${{ github.sha }}
+            ai.bf-vllm.build.channel=${{ steps.prov.outputs.channel }}
+            ai.bf-vllm.bf.version=${{ steps.prov.outputs.bf_version }}
+            ai.bf-vllm.scm.version=${{ steps.prov.outputs.scm_version }}
+
+      - name: Build and push NVIDIA image
+        id: build
+        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2
+        with:
+          # context = src/: upstream source with the overlaid BF Dockerfile
+          # (upstream channel), or the bf-vllm tree (dev/release).
+          context: src
+          file: src/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # USE_SCCACHE=1 with an empty SCCACHE_BUCKET_NAME selects the local-disk
+          # sccache backend in the BF Dockerfile: the S3 vars are gated on a
+          # non-empty bucket, so an empty bucket leaves only SCCACHE_DIR=/sccache,
+          # persisted across runs by the Blacksmith BuildKit cache mount
+          # (ADR-0005 amendment). No S3 bucket in any channel.
+          #
+          # torch_cuda_arch_list overrides the Dockerfile default
+          # ('7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX') down to the hardware
+          # Blackfuel actually runs — Hopper (9.0: H100/H200) and Blackwell
+          # (10.0: B200/B300). This is ADR-0005 lever #2 (arch-list trim): each
+          # extra CUDA arch is a full nvcc pass, and the untrimmed list compiles
+          # ~452 CUDA objects in the csrc wheel — a cold build does not finish
+          # inside the runner limit. Trimming to 2 arches cuts that ~25-40%.
+          build-args: |
+            USE_SCCACHE=1
+            SCCACHE_BUCKET_NAME=
+            torch_cuda_arch_list=9.0 10.0
+
+      # Measure pushed image size, write the STEP_SUMMARY metrics table, and
+      # post a Block Kit build summary to Slack — all in one shared composite
+      # action (.github/actions/bf-build-notify). always() so a failed build
+      # still reports; fails closed to '—'. Slack is gated on the token below.
+      - name: Report build outcome
+        if: always()
+        uses: ./bf-actions/.github/actions/bf-build-notify
+        with:
+          image: ${{ steps.prov.outputs.image }}
+          # The tag identifying this image best, by channel: the release version,
+          # else the scm-describe dev version, else the upstream version, else
+          # the sha pin — used to measure size and shown in the summary/Slack.
+          image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && format('{0}-dev', steps.prov.outputs.scm_version) || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.short))) }}
+          display-name: vllm-nvidia
+          summary-title: NVIDIA ${{ steps.prov.outputs.channel }} build
+          arch-list: 9.0a 10.0a
+          runner-default: blacksmith-32vcpu
+          started-epoch: ${{ steps.started.outputs.epoch }}
+          build-outcome: ${{ steps.build.outcome }}
+          digest: ${{ steps.build.outputs.digest }}
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
