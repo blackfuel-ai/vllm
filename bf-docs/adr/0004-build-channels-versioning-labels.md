@@ -23,7 +23,7 @@ Versioning is also a constraint: we ship downstream of an upstream version. SemV
 | --- | --- | --- | --- | --- |
 | `release` | `…/vllm-<arch>` | Upstream + BF patches + additive content, versioned & reviewed | `:0.20.2_bf.0.1.0`, `:0.20.2_bf-latest`, `:bf-stable` | Production pool |
 | `upstream` | `…/upstream/vllm-<arch>` | Bare upstream only, no BF layer; our Dockerfile, upstream's vLLM source | `:vX.Y.Z` (at a tag), `:<scm-version>` (between tags), `:latest` | Preview pool only — **distinguished by repository, not label** |
-| `dev` | `…/vllm-<arch>` | PR / manual / local | `:dev-pr-<N>-<sha>`, `:<scm-version>-dev` | Never auto-deployed |
+| `dev` | `…/vllm-<arch>` | PR / manual / local | `:dev-pr-<N>-<sha>`, `:<base-version>-dev-g<sha7>` | Never auto-deployed |
 
 The `upstream` channel lives in a **dedicated repository** (`upstream/vllm-<arch>`), so the registry path itself is the channel signal (see Amendment below). The other two channels share the main `vllm-<arch>` repository and are distinguished by the `ai.bf-vllm.build.channel` label as originally decided.
 
@@ -79,11 +79,11 @@ Upstream tag derivation: the version name is taken the way vLLM takes its own (`
 
 ## Amendment (2026-06-22): dev tags embed the scm-describe version
 
-The `dev` channel tag is `:<scm-version>-dev` (e.g. `:v0.23.1rc0_bf.0.1.0-12-gf10752012-dev`), not the bare `:dev-<sha>` of the original table.
+The `dev` channel tag is `:<base-version>-dev-g<sha7>` (e.g. `:v0.23.1rc0_bf.0.1.0-dev-gf107520`), not the bare `:dev-<sha>` of the original table.
 
 The engine renders an image tag **verbatim** wherever it shows a version — the model-version row, the deployment detail, benchmark rows — with no label lookup and no parsing (it stores `image_tag` as a plain string and echoes it). A bare `:dev-<sha>` therefore surfaces to an operator as a commit hash with no version, which is exactly the readout the channel split set out to make legible. Putting the version *in the tag* is the only lever that changes that surface, because the tag is the one field the engine displays.
 
-The version name is the bf-vllm tree's own `git describe` (`setuptools-scm` form), `+` → `_` sanitised for OCI — the same scheme the upstream channel already uses, applied to the BF tag line. It is taken **BF-first, upstream-fallback**: `git describe --match 'v*+bf.*'`, and if no BF release is reachable (a feature branch cut before the release, or a fresh upstream line with no BF release yet) it falls back to `--match 'v[0-9]*'`. The fallback always resolves on the mirror, so the derivation never fails a build; the `g<sha>` suffix keeps the tag unique per commit, so `:dev-<sha>`'s uniqueness and per-commit `cancel-in-progress` are preserved. The per-PR `:dev-pr-<N>` form is unchanged and is added by the PR-triggered build wiring.
+The base version is the bf-vllm tree's own `git describe` (`setuptools-scm` form), `+` → `_` sanitised for OCI — the same scheme the upstream channel already uses, applied to the BF tag line. It is taken **BF-first, upstream-fallback**: `git describe --match 'v*+bf.*'`, and if no BF release is reachable (a feature branch cut before the release, or a fresh upstream line with no BF release yet) it falls back to `--match 'v[0-9]*'`. The fallback always resolves on the mirror, so the derivation never fails a build. git-describe's between-tags distance suffix (`-<commits-since-tag>-g<sha>`) is stripped to keep the base clean; the commit is instead carried as a trailing `-dev-g<sha7>` marker — the `-dev-` placed *before* the sha so the version reads cleanly up to the marker. The `g<sha7>` suffix keeps the tag unique per commit, so `:dev-<sha>`'s uniqueness and per-commit `cancel-in-progress` are preserved. `bf-tools/version.py` exposes `dev_image_tag()`/`parse_dev_image_tag()` so the derivation lives in one place rather than being hand-assembled in each build workflow. The per-PR `:dev-pr-<N>` form is unchanged and is added by the PR-triggered build wiring.
 
 A new descriptive label `ai.bf-vllm.scm.version` carries the same scm-describe version on every channel, so an agent reading labels (`get_image_labels`) gets the lineage even where it would otherwise have to parse the tag. It is provenance, not a routing input.
 
@@ -98,7 +98,7 @@ A new descriptive label `ai.bf-vllm.scm.version` carries the same scm-describe v
 
 ## Consequences
 
-- **Single canonical version per release** that works as git tag, GitHub release name, and (with `+` → `_`) OCI image tag. `bf-tools/version.py` exposes mechanical `to_image_tag()`/`from_image_tag()`.
+- **Single canonical version per release** that works as git tag, GitHub release name, and (with `+` → `_`) OCI image tag. `bf-tools/version.py` exposes mechanical `to_image_tag()`/`from_image_tag()` for release tags and `dev_image_tag()`/`parse_dev_image_tag()` for the `dev` channel's `-dev-g<sha7>` form.
 - **Engine routing has one source of truth per channel.** `release` and `dev` share a repository and are routed by the `ai.bf-vllm.build.channel` label. `upstream` is routed by its dedicated repository path; its label is descriptive only. No regex on image tags, no fragile string parsing, and no channel encoded twice.
 - **The upstream repository carries bare, vLLM-identical tags** (`:v0.23.1rc0`, `:latest`), so an image is recognisable as a specific upstream vLLM and vLLM-native tooling reads it unmodified — at the cost of one operational invariant: push access to each repository is restricted to the workflow that owns it (location-as-trust is only sound if nothing untrusted can land at a trusted location).
 - **vLLM-native tooling works unmodified** on our images — `ai.vllm.build.commit` still answers "which upstream is this?" with the upstream SHA.
