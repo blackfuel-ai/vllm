@@ -32,6 +32,12 @@ from version import (
         # intentionally don't test them (would surface as ValueError).
         # Single-digit minor/patch on both halves.
         ("v1.0.0+bf.0.0.1", "1.0.0_bf.0.0.1"),
+        # Release-candidate upstream half: the operator-gated bf-release path
+        # may release the temporary rc main sits on between finals. The `rcN`
+        # suffix survives the +bf -> _bf image-tag mapping unchanged (rc has no
+        # `+`, so it is OCI-tag-legal).
+        ("v0.23.1rc0+bf.0.1.0", "0.23.1rc0_bf.0.1.0"),
+        ("v0.23.1rc2+bf.1.0.0", "0.23.1rc2_bf.1.0.0"),
     ],
 )
 def test_round_trip(git_tag: str, image_tag: str) -> None:
@@ -77,9 +83,10 @@ _INVALID_GIT_TAGS = [
     "v0.20.2+bf.alpha.0.0",
     # Empty string
     "",
-    # Pre-release upstream tags are NOT releasable (finals-only policy,
-    # ADR-0002): rcN, hyphenated rc, alpha/beta/dev all rejected.
-    "v0.23.1rc0+bf.0.1.0",
+    # Upstream `rcN` (no separator) IS accepted — see the round-trip cases.
+    # Every OTHER pre-release form is still rejected: only vLLM's own `rcN`
+    # spelling is a real upstream tag; hyphenated rc, alpha/beta, and PEP 440
+    # `.devN` are not shapes upstream releases under.
     "v0.20.2-rc1+bf.0.1.0",
     "v0.20.2a1+bf.0.1.0",
     "v0.20.2b2+bf.0.1.0",
@@ -110,8 +117,6 @@ _INVALID_IMAGE_TAGS = [
     "",
     # Missing _bf. separator
     "0.20.2.0.1.0",
-    # Pre-release upstream (finals-only): rc image tag is not valid.
-    "0.23.1rc0_bf.0.1.0",
 ]
 
 

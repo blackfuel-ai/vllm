@@ -30,14 +30,15 @@ from dataclasses import dataclass
 
 # Strict regex: matches v<upstream>+bf.<bf>, both halves dot-numeric SemVer.
 #
-# We release only against upstream FINAL tags (ADR-0002 tag-gated merge,
-# finals-only), so the upstream half is strictly ``\d+.\d+.\d+`` with no
-# pre-release suffix — release candidates (``0.23.1rc0``) are not releasable
-# and are rejected here. The BF half is likewise dot-numeric (a BF release is
-# always a finished increment). If the policy ever changes to release on
-# candidates, add an optional ``(?:rc\d+)?`` to the upstream half here and the
-# matching group to the sync workflow's RELEASE_TAG_RE, with explicit tests.
-_UPSTREAM = r"\d+\.\d+\.\d+"
+# The upstream half is ``\d+.\d+.\d+`` with an OPTIONAL ``rcN`` pre-release
+# suffix, so a Blackfuel release may be cut against either a final
+# (``0.23.1``) or a release candidate (``0.23.1rc0``). The two release paths
+# differ deliberately: the ``bf-sync-upstream`` automation stays FINALS-ONLY
+# (its ``RELEASE_TAG_RE`` rejects rc, so it never auto-tracks a candidate),
+# while the operator-gated ``bf-release`` path MAY release the temporary rc
+# that ``main`` is sitting on between finals. The BF half is dot-numeric (a BF
+# release is always a finished increment — no rc on our own layer).
+_UPSTREAM = r"\d+\.\d+\.\d+(?:rc\d+)?"
 _BF = r"\d+\.\d+\.\d+"
 
 # The f-string braces interpolate the pre-assembled regex fragments above
