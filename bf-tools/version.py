@@ -59,7 +59,9 @@ _IMAGE_TAG_RE = re.compile(rf"^(?P<upstream>{_UPSTREAM})_bf\.(?P<bf>{_BF})$")
 # past the nearest matching tag. The dev image tag carries the commit itself
 # (``-dev-g<sha7>``), so this distance suffix is stripped to recover the base
 # version. ``[0-9a-f]+`` matches the ``g``-prefixed abbreviated sha describe
-# emits (length varies with repo ambiguity, hence not fixed-width).
+# emits (length varies with repo ambiguity, hence not fixed-width). The trailing
+# ``$`` anchor means ``sub`` only ever removes a suffix — never a mid-string
+# match — so a base whose own text contains ``-N-gHEX`` earlier is untouched.
 _DESCRIBE_DISTANCE_RE = re.compile(r"-\d+-g[0-9a-f]+$")
 
 # A dev image tag: ``<base-version>-dev-g<sha7>`` (e.g.
@@ -68,6 +70,11 @@ _DESCRIBE_DISTANCE_RE = re.compile(r"-\d+-g[0-9a-f]+$")
 # line or upstream fallback), NOT the ADR-0004 release image tag, so it is not
 # re-validated against the BfVersion grammar here.
 _DEV_IMAGE_TAG_RE = re.compile(r"^(?P<base>.+)-dev-g(?P<sha7>[0-9a-f]{7})$")
+
+# A git commit sha is lowercase hex; the dev tag's ``g<sha7>`` is the first 7
+# chars, so a non-hex sha would emit a tag the parser above rejects. Validate at
+# the source instead of producing an unparsable tag.
+_SHA_RE = re.compile(r"^[0-9a-f]+$")
 
 
 @dataclass(frozen=True)
@@ -182,16 +189,18 @@ def dev_image_tag(scm_describe: str, sha: str) -> str:
             ``v0.23.1rc0+bf.0.1.0-2-gaebd933d0`` (the ``-N-gSHA`` distance
             suffix is optional — a build exactly at a tag has none). Either the
             ``+`` git form or the ``_`` OCI form is accepted.
-        sha: The full commit sha; its first 7 chars become the ``g<sha7>``.
+        sha: The full commit sha (hex); its first 7 chars become the
+            ``g<sha7>``.
 
     Returns:
         e.g. ``v0.23.1rc0_bf.0.1.0-dev-gaebd933``.
 
     Raises:
-        ValueError: If ``sha`` is shorter than 7 chars.
+        ValueError: If ``sha`` is shorter than 7 chars or not lowercase hex —
+            either would yield a tag :func:`parse_dev_image_tag` rejects.
     """
-    if len(sha) < 7:
-        raise ValueError(f"sha must be at least 7 chars, got {sha!r}")
+    if len(sha) < 7 or not _SHA_RE.match(sha):
+        raise ValueError(f"sha must be >=7 lowercase-hex chars, got {sha!r}")
     base = _DESCRIBE_DISTANCE_RE.sub("", scm_describe).replace("+", "_")
     return f"{base}-dev-g{sha[:7]}"
 

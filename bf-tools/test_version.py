@@ -202,8 +202,24 @@ def test_dev_image_tag_takes_exactly_seven_sha_chars() -> None:
 
 
 def test_dev_image_tag_rejects_short_sha() -> None:
-    with pytest.raises(ValueError, match="at least 7 chars"):
+    with pytest.raises(ValueError, match="lowercase-hex"):
         dev_image_tag("v0.20.2+bf.0.1.0", "abc123")
+
+
+@pytest.mark.parametrize(
+    "bad_sha",
+    [
+        "ZZZZZZZ",  # non-hex
+        "AEBD933",  # uppercase hex (git emits lowercase)
+        "aebd-933",  # punctuation
+        "aebd 933",  # whitespace
+    ],
+)
+def test_dev_image_tag_rejects_non_hex_sha(bad_sha: str) -> None:
+    """A non-hex sha would emit a tag parse_dev_image_tag rejects, so reject it
+    at the source."""
+    with pytest.raises(ValueError, match="lowercase-hex"):
+        dev_image_tag("v0.20.2+bf.0.1.0", bad_sha)
 
 
 @pytest.mark.parametrize(
