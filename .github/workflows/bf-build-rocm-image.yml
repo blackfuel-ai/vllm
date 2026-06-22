@@ -201,12 +201,12 @@ jobs:
 
           # bf_image_tag / bf_version / bf_upstream: the canonical release
           # identity, derived from git_tag via bf-tools/version.py. Only consumed
-          # by the release channel. A malformed git_tag must FAIL the build, not
-          # silently produce empty tags — so the python parse runs in a plain
-          # command substitution whose non-zero exit is checked explicitly
-          # (a `read < <(python …)` process substitution would let parse_git_tag's
-          # failure pass as empty fields, since `read` does not propagate the
-          # substituted process's exit status).
+          # by the release channel. The parse runs as a single-line `python -c`
+          # (not an indented `<<'PY'` heredoc, whose preserved YAML indentation
+          # would make Python raise IndentationError) in a plain command
+          # substitution whose non-zero exit is checked explicitly — a malformed
+          # git_tag must FAIL the build, not silently yield empty tags (a
+          # `read < <(python …)` would swallow the failure as empty fields).
           bf_image_tag=""
           bf_version=""
           bf_upstream=""
@@ -215,14 +215,7 @@ jobs:
               echo "::error::channel=release requires git_tag (e.g. v0.23.1rc0+bf.0.1.0)." >&2
               exit 1
             fi
-            if ! bf_fields="$(python - "$GIT_TAG" <<'PY'
-          import sys
-          sys.path.insert(0, "bf-tools")
-          from version import parse_git_tag
-          v = parse_git_tag(sys.argv[1])
-          print(v.image_tag, v.bf, v.upstream)
-          PY
-          )"; then
+            if ! bf_fields="$(python -c 'import sys; sys.path.insert(0, "bf-tools"); from version import parse_git_tag; v = parse_git_tag(sys.argv[1]); print(v.image_tag, v.bf, v.upstream)' "$GIT_TAG")"; then
               echo "::error::git_tag '${GIT_TAG}' failed to parse via bf-tools/version.py (expected v<upstream>+bf.<bf>)." >&2
               exit 1
             fi
