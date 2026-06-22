@@ -19,10 +19,13 @@
 #                     BF-layered source, so it is checked into src/ as-is with NO
 #                     overlay. Pushed to the shared repository, label-routed and
 #                     never auto-deployed:
-#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-nvidia:<scm-version>-dev
-#                     The tag embeds the scm-describe version (not a bare sha)
-#                     because the engine renders the image tag verbatim — a bare
-#                     sha would read as "no version" on the deployment page.
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-nvidia:<base-version>-dev-<sha7>
+#                     e.g. …/vllm-nvidia:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
+#                     embeds the clean base version (not a bare sha) because the
+#                     engine renders the image tag verbatim — a bare sha would
+#                     read as "no version" on the deployment page. The trailing
+#                     <sha7> marker carries the commit, keeping it unique per
+#                     commit.
 #   channel=release   the bf-vllm tree at the release ref, tagged with the
 #                     canonical release version. Orchestrated by bf-release.yml,
 #                     which passes `git_tag`; this workflow only builds + pushes.
@@ -158,6 +161,16 @@ jobs:
                   || git -C src describe --tags --match 'v[0-9]*' HEAD)"
           scm_version="${scm_raw//+/_}"
 
+          # dev_image_tag: the dev-channel tag <base-version>-dev-<sha7>, the
+          # clean base scm version (git-describe distance suffix stripped) plus
+          # the literal commit. Built by the single source of truth
+          # (src/bf-tools/version.py) so the format lives in one place. Only the
+          # dev channel consumes it; empty otherwise.
+          dev_image_tag=""
+          if [ "$CHANNEL" = "dev" ]; then
+            dev_image_tag="$(python -c 'import sys; sys.path.insert(0, "src/bf-tools"); from version import dev_image_tag; print(dev_image_tag(sys.argv[1], sys.argv[2]))' "$scm_raw" "$sha")"
+          fi
+
           # bf_image_tag / bf_version / bf_upstream: the canonical release
           # identity, derived from git_tag via the single source of truth
           # (bf-tools/version.py). Only consumed by the release channel;
@@ -187,6 +200,7 @@ jobs:
             echo "short=${short}"
             echo "version=${version}"
             echo "scm_version=${scm_version}"
+            echo "dev_image_tag=${dev_image_tag}"
             echo "bf_image_tag=${bf_image_tag}"
             echo "bf_version=${bf_version}"
             echo "bf_upstream=${bf_upstream}"
@@ -242,16 +256,16 @@ jobs:
           #   upstream — bare, vLLM-identical in the dedicated upstream repo:
           #     :sha-<short> always; :vX.Y.Z on an upstream release tag;
           #     :latest only for upstream-main (no other ref may clobber it).
-          #   dev — the scm-describe version + a -dev marker; the version (not a
-          #     bare sha) is what the engine shows verbatim, and the embedded
-          #     g<sha> keeps it unique per commit.
+          #   dev — <base-version>-dev-<sha7> (e.g. v0.23.1rc0_bf.0.1.0-dev-
+          #     aebd933); the base version (not a bare sha) is what the engine
+          #     shows verbatim, and the <sha7> marker keeps it unique per commit.
           #   release — the immutable release version + the two moving aliases
           #     (<upstream>_bf-latest, bf-stable) for engine pinning/promotion.
           tags: |
             type=raw,value=sha-${{ steps.prov.outputs.short }},enable=${{ steps.prov.outputs.channel == 'upstream' }}
             type=raw,value=${{ steps.prov.outputs.version }},enable=${{ steps.prov.outputs.channel == 'upstream' && steps.prov.outputs.version != '' }}
             type=raw,value=latest,enable=${{ steps.prov.outputs.channel == 'upstream' && github.event.inputs.ref == 'upstream-main' }}
-            type=raw,value=${{ steps.prov.outputs.scm_version }}-dev,enable=${{ steps.prov.outputs.channel == 'dev' }}
+            type=raw,value=${{ steps.prov.outputs.dev_image_tag }},enable=${{ steps.prov.outputs.channel == 'dev' }}
             type=raw,value=${{ steps.prov.outputs.bf_image_tag }},enable=${{ steps.prov.outputs.channel == 'release' }}
             type=raw,value=${{ steps.prov.outputs.bf_upstream }}_bf-latest,enable=${{ steps.prov.outputs.channel == 'release' }}
             type=raw,value=bf-stable,enable=${{ steps.prov.outputs.channel == 'release' }}
@@ -315,9 +329,9 @@ jobs:
         with:
           image: ${{ steps.prov.outputs.image }}
           # The tag identifying this image best, by channel: the release version,
-          # else the scm-describe dev version, else the upstream version, else
-          # the sha pin — used to measure size and shown in the summary/Slack.
-          image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && format('{0}-dev', steps.prov.outputs.scm_version) || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.short))) }}
+          # else the dev image tag, else the upstream version, else the sha pin
+          # — used to measure size and shown in the summary/Slack.
+          image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && steps.prov.outputs.dev_image_tag || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.short))) }}
           display-name: vllm-nvidia
           summary-title: NVIDIA ${{ steps.prov.outputs.channel }} build
           arch-list: 9.0a 10.0a
