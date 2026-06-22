@@ -23,7 +23,7 @@ Versioning is also a constraint: we ship downstream of an upstream version. SemV
 | --- | --- | --- | --- | --- |
 | `release` | `…/vllm-<arch>` | Upstream + BF patches + additive content, versioned & reviewed | `:0.20.2_bf.0.1.0`, `:0.20.2_bf-latest`, `:bf-stable` | Production pool |
 | `upstream` | `…/upstream/vllm-<arch>` | Bare upstream only, no BF layer; our Dockerfile, upstream's vLLM source | `:vX.Y.Z` (at a tag), `:<scm-version>` (between tags), `:latest` | Preview pool only — **distinguished by repository, not label** |
-| `dev` | `…/vllm-<arch>` | PR / manual / local | `:dev-pr-<N>-<sha>`, `:dev-<sha>` | Never auto-deployed |
+| `dev` | `…/vllm-<arch>` | PR / manual / local | `:dev-pr-<N>-<sha>`, `:<scm-version>-dev` | Never auto-deployed |
 
 The `upstream` channel lives in a **dedicated repository** (`upstream/vllm-<arch>`), so the registry path itself is the channel signal (see Amendment below). The other two channels share the main `vllm-<arch>` repository and are distinguished by the `ai.bf-vllm.build.channel` label as originally decided.
 
@@ -56,6 +56,7 @@ ai.bf-vllm.build.commit                = <bf-vllm main SHA — same as image.rev
 ai.bf-vllm.image.tag                   = 0.20.2_bf.0.1.0
 ai.bf-vllm.build.channel               = release | upstream | dev
 ai.bf-vllm.bf.version                  = 0.1.0 (only when channel=release)
+ai.bf-vllm.scm.version                 = <git-describe of the tree, +→_> (provenance; see 2026-06-22 dev-tag amendment)
 ```
 
 The namespace rule is unambiguous: **a label's namespace identifies who defined it, not what value it holds**. `ai.vllm.*` labels keep their original semantic (so vLLM-native tooling works on our images unmodified). `ai.bf-vllm.*` holds BF-specific facts and parallel-structured provenance for our build.
@@ -75,6 +76,16 @@ This is a deliberate, scoped reversal of "route by label, not by location" — *
 `release` and `dev` are **not** moved — they share the `vllm-<arch>` repository and stay label-routed. Splitting all three was considered and rejected: release↔dev distinction is low-risk (both are BF-layer builds in the same trust family) and a per-PR `dev` repository multiplies registry credentials and GC policy for no safety gain. Only `upstream` — the one channel that is a different trust family (bare upstream, no review) and wants vLLM-native tags — earns its own repository.
 
 Upstream tag derivation: the version name is taken the way vLLM takes its own (`setuptools-scm`, i.e. `git describe` against upstream tags), `+` → `_` sanitised for OCI. A build exactly at an upstream tag is the clean name (`v0.23.1rc0`); a build between tags carries the scm dev-distance suffix, which honestly marks it as not-a-release. `:latest` moves only when building the canonical `upstream-main` ref.
+
+## Amendment (2026-06-22): dev tags embed the scm-describe version
+
+The `dev` channel tag is `:<scm-version>-dev` (e.g. `:v0.23.1rc0_bf.0.1.0-12-gf10752012-dev`), not the bare `:dev-<sha>` of the original table.
+
+The engine renders an image tag **verbatim** wherever it shows a version — the model-version row, the deployment detail, benchmark rows — with no label lookup and no parsing (it stores `image_tag` as a plain string and echoes it). A bare `:dev-<sha>` therefore surfaces to an operator as a commit hash with no version, which is exactly the readout the channel split set out to make legible. Putting the version *in the tag* is the only lever that changes that surface, because the tag is the one field the engine displays.
+
+The version name is the bf-vllm tree's own `git describe` (`setuptools-scm` form), `+` → `_` sanitised for OCI — the same scheme the upstream channel already uses, applied to the BF tag line. It is taken **BF-first, upstream-fallback**: `git describe --match 'v*+bf.*'`, and if no BF release is reachable (a feature branch cut before the release, or a fresh upstream line with no BF release yet) it falls back to `--match 'v[0-9]*'`. The fallback always resolves on the mirror, so the derivation never fails a build; the `g<sha>` suffix keeps the tag unique per commit, so `:dev-<sha>`'s uniqueness and per-commit `cancel-in-progress` are preserved. The per-PR `:dev-pr-<N>` form is unchanged and is added by the PR-triggered build wiring.
+
+A new descriptive label `ai.bf-vllm.scm.version` carries the same scm-describe version on every channel, so an agent reading labels (`get_image_labels`) gets the lineage even where it would otherwise have to parse the tag. It is provenance, not a routing input.
 
 ## Alternatives considered
 
