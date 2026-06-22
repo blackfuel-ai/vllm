@@ -476,14 +476,36 @@ COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
 ARG DEEPEP_COMMIT_HASH=73b6ea4
 ARG NVSHMEM_VER
+# [bf-patch] The install pulls DeepEP (git clone) and an nvshmem tarball over
+# the network. These have flaked mid-transfer in CI (curl exit 56: SSL EOF) —
+# upstream's per-curl --retry does not cover a partial-transfer SSL reset, and
+# the git clone has no retry at all. Wrap the whole install in a 3-attempt
+# backoff so a transient download drop retries instead of failing the multi-hour
+# build. TORCH_CUDA_ARCH_LIST stays '9.0a 10.0a' (architecture-specific SM90a/
+# SM100a PTX that DeepEP kernels require — distinct from the main flashinfer
+# compile, which uses plain 9.0/10.0).
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
     export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
-    /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
-        ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
+    for attempt in 1 2 3; do \
+        echo "=== DeepEP/nvshmem install: attempt ${attempt}/3 ===" && \
+        /tmp/install_python_libraries.sh \
+            --workspace /tmp/ep_kernels_workspace \
+            --mode wheel \
+            ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
+            ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} \
+        && break \
+        || { \
+            rc=$?; \
+            echo "=== DeepEP/nvshmem install attempt ${attempt}/3 failed (exit ${rc}) ===" >&2; \
+            if [ "${attempt}" -eq 3 ]; then \
+                echo "=== DeepEP/nvshmem install: exhausted 3 attempts, giving up ===" >&2; \
+                exit "${rc}"; \
+            fi; \
+            echo "=== retrying in $((attempt * 15))s (transient download failures: curl SSL EOF, git clone drops) ===" >&2; \
+            sleep $((attempt * 15)); \
+        }; \
+    done && \
     find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
 #################### EXTENSIONS BUILD IMAGE ####################
 
