@@ -412,3 +412,9 @@ jobs:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           payload-file-path: ${{ steps.slack-msg.outputs.payload_file }}
+          # Fail the step if Slack rejects the post (e.g. not_in_channel,
+          # channel_not_found, invalid_auth). The default (errors: false) returns
+          # green on an `ok:false` API response, which silently dropped the first
+          # release's notification when the bot was not yet in the channel. Surface
+          # it instead so a misconfigured channel/token is visible, not silent.
+          errors: true

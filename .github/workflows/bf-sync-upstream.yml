@@ -578,3 +578,7 @@ jobs:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           payload-file-path: ${{ steps.slack-msg.outputs.payload_file }}
+          # Fail the step if Slack rejects the post (not_in_channel, etc.) rather
+          # than returning green on an `ok:false` response — silent drops hide a
+          # misconfigured channel/token.
+          errors: true
