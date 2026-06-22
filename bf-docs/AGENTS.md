@@ -125,7 +125,7 @@ Every agent-authored action carries an `[agent][<skill-id>]` prefix in PR titles
 Three image channels, each with a distinct consumer:
 
 - **`release`** — `ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm:0.20.2_bf.0.1.0`. Reviewed, blessed, what production pulls.
-- **`upstream`** — `:upstream-latest`. Built off bare `upstream-main` on every sync. Fast-path for new-model availability — preview deployments use this.
+- **`upstream`** — its own repository `ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-rocm`, bare vLLM-identical tags (`:latest`, `:vX.Y.Z`, `:sha-<short>`). Built off bare `upstream-main` on every sync. Fast-path for new-model availability — preview deployments use this. Routed by repository path, not by label (ADR-0004 amendment).
 - **`dev`** — `:dev-pr-N-<sha>`. Per-PR builds for testing in staging.
 
 Versioning is `v<upstream-semver>+bf.<bf-semver>` (e.g. `v0.20.2+bf.0.1.0`). OCI image tag is the same string with `+` → `_` per OCI naming rules. See [ADR-0004](./adr/0004-build-channels-versioning-labels.md) for the full label schema (`org.opencontainers.image.*` + `ai.vllm.*` + `ai.bf-vllm.*`).

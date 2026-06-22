@@ -41,7 +41,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/blackfuel-ai/bf-vllm/vllm-nvidia
+  # upstream channel = its own repository (ADR-0004 amendment 2026-06-22).
+  # The registry path is the channel signal, so tags are bare and
+  # vLLM-identical; the engine recognises an upstream image by this path and
+  # the production pool never points here.
+  IMAGE: ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-nvidia
 
 jobs:
   build:
@@ -77,16 +81,27 @@ jobs:
 
       - name: Resolve build provenance
         id: rev
-        # Tag uses a fixed 7-char abbreviation of the upstream commit (not
-        # `git rev-parse --short`, whose length varies as the repo grows);
-        # the label carries the full SHA for reproducibility. Matches the
-        # cpu/rocm from-upstream workflows so all three tag identically.
+        # `sha-<short>` is the immutable per-build pin (label carries the full
+        # SHA). `version` is the bare vLLM-identical name, set only when the
+        # built ref is an upstream release tag (vX.Y.Z[rcN]) — then we publish
+        # `:vX.Y.Z` exactly as vLLM names it. A between-tags build (upstream-main
+        # or a bare sha) has no release name, so `version` is empty and only the
+        # sha pin (+ `:latest` for upstream-main) is published. Matches the
+        # cpu/rocm from-upstream workflows so all arches tag identically.
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
         run: |
           set -euo pipefail
           upstream_sha="$(git rev-parse HEAD)"
+          if printf '%s' "$UPSTREAM_REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'; then
+            version="$UPSTREAM_REF"
+          else
+            version=""
+          fi
           {
             echo "upstream_sha=${upstream_sha}"
             echo "upstream_short=${upstream_sha:0:7}"
+            echo "version=${version}"
           } >> "$GITHUB_OUTPUT"
         working-directory: src
 
@@ -108,6 +123,19 @@ jobs:
       - name: Stage patched Dockerfile into the upstream context
         run: cp bf/docker/Dockerfile src/docker/Dockerfile
 
+      # The build context above is bare upstream vLLM source, so the
+      # bf-build-notify composite action is not present at the workspace root.
+      # Sparse-checkout just .github/actions from the calling bf-vllm ref into
+      # bf-actions/ so `uses: ./bf-actions/...` below resolves — the same path
+      # the cpu/cpu-bench/rocm builds use, so all four reference one action path.
+      - name: Checkout BF composite actions from the calling ref
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.ref_name }}
+          path: bf-actions
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
       - name: Set up Blacksmith Docker builder
         uses: useblacksmith/setup-docker-builder@ab5c1da94f53f5cd75c1038092aa276dddfccbba # v1
 
@@ -123,17 +151,24 @@ jobs:
         uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
         with:
           images: ${{ env.IMAGE }}
-          # `:upstream-<sha>` is immutable per build. `:upstream-latest` is a
-          # shared moving tag consumers depend on, so only apply it when
-          # building the canonical upstream-main ref — dispatching any other
-          # ref (a tag, a feature branch) must not clobber it.
+          # Bare, vLLM-identical tags in the dedicated upstream repository:
+          #   :sha-<short>  immutable per-build pin (always).
+          #   :vX.Y.Z       the release name, only when building an upstream
+          #                 release tag (steps.rev version non-empty).
+          #   :latest       the moving tag, only when building the canonical
+          #                 upstream-main ref — any other ref must not clobber it.
           tags: |
-            type=raw,value=upstream-${{ steps.rev.outputs.upstream_short }}
-            type=raw,value=upstream-latest,enable=${{ inputs.upstream_ref == 'upstream-main' }}
+            type=raw,value=sha-${{ steps.rev.outputs.upstream_short }}
+            type=raw,value=${{ steps.rev.outputs.version }},enable=${{ steps.rev.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ inputs.upstream_ref == 'upstream-main' }}
+          # ai.bf-vllm.build.channel stays as descriptive provenance — engine
+          # routing for the upstream channel is by repository path, not this
+          # label (ADR-0004 amendment).
           labels: |
             org.opencontainers.image.source=https://github.com/blackfuel-ai/bf-vllm
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=upstream-${{ steps.rev.outputs.upstream_short }}
+            org.opencontainers.image.version=${{ steps.rev.outputs.version || format('sha-{0}', steps.rev.outputs.upstream_short) }}
+            ai.vllm.image.tag=${{ steps.rev.outputs.version }}
             ai.bf-vllm.build.channel=upstream
             ai.vllm.build.commit=${{ steps.rev.outputs.upstream_sha }}
 
@@ -172,10 +207,13 @@ jobs:
       # still reports; fails closed to '—'. Slack is gated on the token below.
       - name: Report build outcome
         if: always()
-        uses: ./.github/actions/bf-build-notify
+        uses: ./bf-actions/.github/actions/bf-build-notify
         with:
           image: ${{ env.IMAGE }}
-          tag: upstream-${{ steps.rev.outputs.upstream_short }}
+          # The version name when we built a release tag, else the sha pin —
+          # whichever image tag identifies this image best (used to measure size
+          # and shown in the summary/Slack).
+          image-tag: ${{ steps.rev.outputs.version || format('sha-{0}', steps.rev.outputs.upstream_short) }}
           display-name: vllm-nvidia
           summary-title: NVIDIA from-upstream build
           arch-list: 9.0a 10.0a

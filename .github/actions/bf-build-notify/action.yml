@@ -19,10 +19,13 @@ description: >-
 
 inputs:
   image:
-    description: "Image repo without tag, e.g. ghcr.io/blackfuel-ai/bf-vllm/vllm-nvidia."
+    description: "Image repo without a tag, e.g. ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-nvidia."
     required: true
-  tag:
-    description: "Tag of the pushed image to measure, e.g. upstream-<short-sha>."
+  image-tag:
+    description: >-
+      The OCI image tag of the pushed image to measure (the part after `:`),
+      e.g. `v0.23.1rc0` or `sha-e3e3cd5`. This is the registry tag, not a git
+      ref. Combined with `image` as `<image>:<image-tag>`.
     required: true
   display-name:
     description: "Image name shown in Slack, e.g. vllm-nvidia."
@@ -72,7 +75,7 @@ runs:
       if: always()
       shell: bash
       env:
-        REF: ${{ inputs.image }}:${{ inputs.tag }}
+        REF: ${{ inputs.image }}:${{ inputs.image-tag }}
         PUSHED: ${{ inputs.build-outcome }}
       run: |
         set -uo pipefail
@@ -124,7 +127,7 @@ runs:
         OUTCOME: ${{ inputs.build-outcome }}
         STARTED: ${{ inputs.started-epoch }}
         DIGEST: ${{ inputs.digest }}
-        SHA: ${{ inputs.tag }}
+        TAG: ${{ inputs.image-tag }}
         SIZE: ${{ steps.size.outputs.size_human }}
         TITLE: ${{ inputs.summary-title }}
         ARCH: ${{ inputs.arch-list }}
@@ -152,7 +155,7 @@ runs:
           # same values rendered in the summary (no second source of truth).
           echo "runner=$runner"
           echo "digest=${DIGEST:-—}"
-          echo "sha=${SHA:-—}"
+          echo "tag=${TAG:-—}"
           echo "size=${SIZE:-—}"
         } >> "$GITHUB_OUTPUT"
         {
@@ -163,11 +166,14 @@ runs:
           echo "| result | $status |"
           echo "| duration | $dur |"
           echo "| runner | $runner |"
-          echo "| upstream sha | \`${SHA:-—}\` |"
+          echo "| image tag | \`${TAG:-—}\` |"
           echo "| image digest | \`${DIGEST:-—}\` |"
           echo "| image size | ${SIZE:-—} |"
           # Arch list only applies to the GPU builds; omit the row when empty.
-          [ -n "$ARCH" ] && echo "| arch list | $ARCH |"
+          # Use a full `if` (not `[ -n "$ARCH" ] && echo`): as the last command
+          # in this group, the && form returns the test's non-zero exit when
+          # ARCH is empty, which under `set -e` would fail the whole step.
+          if [ -n "$ARCH" ]; then echo "| arch list | $ARCH |"; fi
         } >> "$GITHUB_STEP_SUMMARY"
 
     # Build the Block Kit payload as JSON so the optional arch field drops out
@@ -184,7 +190,7 @@ runs:
         CHANNEL: C0BAGEB5FST
         NAME: ${{ inputs.display-name }}
         STATUS: ${{ steps.metrics.outputs.status }}
-        SHA: ${{ steps.metrics.outputs.sha }}
+        TAG: ${{ steps.metrics.outputs.tag }}
         DURATION: ${{ steps.metrics.outputs.duration }}
         SIZE: ${{ steps.metrics.outputs.size }}
         RUNNER: ${{ steps.metrics.outputs.runner }}
@@ -197,7 +203,7 @@ runs:
         # builds. jq builds valid JSON and escapes everything for us.
         jq -n \
           --arg channel "$CHANNEL" --arg name "$NAME" --arg status "$STATUS" \
-          --arg sha "$SHA" --arg duration "$DURATION" --arg size "$SIZE" \
+          --arg tag "$TAG" --arg duration "$DURATION" --arg size "$SIZE" \
           --arg runner "$RUNNER" --arg digest "$DIGEST" --arg arch "$ARCH" \
           --arg run_url "$RUN_URL" '
           ( [ { type: "mrkdwn", text: ("*Duration*\n" + $duration) },
@@ -208,10 +214,10 @@ runs:
           ) as $fields |
           {
             channel: $channel,
-            text: ($status + " " + $name + " upstream-" + $sha + " — built in " + $duration + " · " + $size),
+            text: ($status + " " + $name + " " + $tag + " — built in " + $duration + " · " + $size),
             blocks: [
               { type: "section",
-                text: { type: "mrkdwn", text: ($status + " *" + $name + "* `upstream-" + $sha + "`") } },
+                text: { type: "mrkdwn", text: ($status + " *" + $name + "* `" + $tag + "`") } },
               { type: "section", fields: $fields },
               { type: "context",
                 elements: [ { type: "mrkdwn", text: ("<" + $run_url + "|run log>") } ] }
