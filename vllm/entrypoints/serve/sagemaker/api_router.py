@@ -94,7 +94,7 @@ def attach_router(
         ]
         msg = f"Cannot find suitable handler for request. Expected one of: {type_names}"
         res = base(raw_request).create_error_response(message=msg)
-        return JSONResponse(content=res.model_dump(), status_code=res.error.code)
+        return JSONResponse(content=res.model_dump(), status_code=res.error.status_code)
 
     app.include_router(router)
 

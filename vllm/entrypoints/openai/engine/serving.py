@@ -227,7 +227,7 @@ class OpenAIServing(BeamSearchOnlineMixin):
                 return None
             if (
                 isinstance(load_result, ErrorResponse)
-                and load_result.error.code == HTTPStatus.BAD_REQUEST.value
+                and load_result.error.status_code == HTTPStatus.BAD_REQUEST.value
             ):
                 error_response = load_result
 

@@ -53,7 +53,9 @@ async def create_generative_scoring(raw_request: Request):
     result = await handler.create_generative_scoring(gen_request, raw_request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return JSONResponse(
+            content=result.model_dump(), status_code=result.error.status_code
+        )
     elif isinstance(result, GenerativeScoringResponse):
         return JSONResponse(content=result.model_dump())
 

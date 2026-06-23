@@ -61,7 +61,9 @@ class ErrorInfo(OpenAIBaseModel):
     message: str
     type: str
     param: str | None = None
-    code: int
+    code: str | None = None
+    # HTTP status for the response, kept out of the OpenAI-shaped body.
+    status_code: int = Field(exclude=True)
 
 
 class ErrorResponse(OpenAIBaseModel):

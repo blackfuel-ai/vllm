@@ -15,6 +15,8 @@ pub enum ApiError {
         message: String,
         param: Option<&'static str>,
     },
+    /// The prompt (plus requested output) exceeds the model's context length.
+    ContextLengthExceeded { message: String },
     /// The requested model name does not match the single configured model.
     ModelNotFound { model: String },
     /// The request body could not be parsed as valid JSON.
@@ -28,6 +30,7 @@ impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::ModelNotFound { .. } => StatusCode::NOT_FOUND,
             Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::JsonParseError { .. } => StatusCode::BAD_REQUEST,
@@ -43,6 +46,12 @@ impl ApiError {
                 error_type: "invalid_request_error".to_string(),
                 param: param.map(|p| p.to_string()),
                 code: Some("invalid_request_error".to_string()),
+            },
+            Self::ContextLengthExceeded { message } => ErrorDetail {
+                message: message.clone(),
+                error_type: "invalid_request_error".to_string(),
+                param: None,
+                code: Some("context_length_exceeded".to_string()),
             },
             Self::ModelNotFound { model } => ErrorDetail {
                 message: format!("The model `{model}` does not exist."),
@@ -79,6 +88,9 @@ impl IntoResponse for ApiError {
 /// tokenization) are the client's fault and map to HTTP 400, mirroring the
 /// Python frontend. Everything else stays an internal 500.
 pub fn text_submit_error(context: &'static str, error: vllm_text::Error) -> ApiError {
+    if let vllm_text::Error::PromptTooLong { .. } = &error {
+        return ApiError::context_length_exceeded(format!("{error}"));
+    }
     if is_prompt_validation_error(&error) {
         return invalid_request!("{error}");
     }
@@ -89,7 +101,10 @@ pub fn text_submit_error(context: &'static str, error: vllm_text::Error) -> ApiE
 /// text errors and raises its own prompt-length variant).
 pub fn chat_submit_error(context: &'static str, error: vllm_chat::Error) -> ApiError {
     match &error {
-        vllm_chat::Error::PromptTooLong { .. } => invalid_request!("{error}"),
+        vllm_chat::Error::PromptTooLong { .. }
+        | vllm_chat::Error::Text(vllm_text::Error::PromptTooLong { .. }) => {
+            ApiError::context_length_exceeded(format!("{error}"))
+        }
         vllm_chat::Error::Text(text_error) if is_prompt_validation_error(text_error) => {
             invalid_request!("{error}")
         }
@@ -113,7 +128,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_too_long_maps_to_invalid_request() {
+    fn prompt_too_long_maps_to_context_length_exceeded() {
         let error = vllm_text::Error::PromptTooLong {
             max_model_len: 8192,
             prompt_len: 9000,
@@ -122,18 +137,26 @@ mod tests {
         assert_eq!(api_error.status_code(), StatusCode::BAD_REQUEST);
         let response = api_error.to_error_response();
         assert_eq!(response.error.error_type, "invalid_request_error");
+        assert_eq!(
+            response.error.code.as_deref(),
+            Some("context_length_exceeded")
+        );
         assert!(response.error.message.contains("8192"));
         assert!(response.error.message.contains("9000"));
     }
 
     #[test]
-    fn chat_wrapped_prompt_too_long_maps_to_invalid_request() {
+    fn chat_wrapped_prompt_too_long_maps_to_context_length_exceeded() {
         let error = vllm_chat::Error::Text(vllm_text::Error::PromptTooLong {
             max_model_len: 8192,
             prompt_len: 9000,
         });
         let api_error = chat_submit_error("failed to submit chat request", error);
         assert_eq!(api_error.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            api_error.to_error_response().error.code.as_deref(),
+            Some("context_length_exceeded")
+        );
     }
 
     #[test]

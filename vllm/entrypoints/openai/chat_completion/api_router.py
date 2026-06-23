@@ -62,7 +62,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
+            content=generator.model_dump(), status_code=generator.error.status_code
         )
 
     elif isinstance(generator, ChatCompletionResponse):
@@ -97,7 +97,9 @@ async def create_batch_chat_completion(
     result = await handler.create_batch_chat_completion(request, raw_request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return JSONResponse(
+            content=result.model_dump(), status_code=result.error.status_code
+        )
 
     return JSONResponse(content=result.model_dump())
 

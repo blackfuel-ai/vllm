@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-from vllm.exceptions import VLLMValidationError
+from vllm.exceptions import APIErrorCode, VLLMValidationError
 from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
 from vllm.logger import init_logger
 from vllm.multimodal.media.connector import merge_media_io_kwargs
@@ -344,6 +344,7 @@ class TokenizeParams:
                     f"number of requested output tokens.",
                     parameter="input_text",
                     value=len(text),
+                    error_code=APIErrorCode.CONTEXT_LENGTH_EXCEEDED,
                 )
 
         return text
@@ -435,6 +436,7 @@ class TokenizeParams:
                 f"number of requested output tokens.",
                 parameter="input_tokens",
                 value=token_count,
+                error_code=APIErrorCode.CONTEXT_LENGTH_EXCEEDED,
             )
 
         return tokens

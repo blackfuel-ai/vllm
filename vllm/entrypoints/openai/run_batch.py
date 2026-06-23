@@ -564,7 +564,7 @@ async def run_request(
             id=f"vllm-{random_uuid()}",
             custom_id=request.custom_id,
             response=BatchResponseData(
-                status_code=response.error.code,
+                status_code=response.error.status_code,
                 request_id=f"vllm-batch-{random_uuid()}",
             ),
             error=response,
@@ -683,7 +683,7 @@ def make_transcription_wrapper(
                     error=ErrorInfo(
                         message=f"Failed to process {operation}: {str(e)}",
                         type="BadRequestError",
-                        code=HTTPStatus.BAD_REQUEST.value,
+                        status_code=HTTPStatus.BAD_REQUEST.value,
                     )
                 )
 
