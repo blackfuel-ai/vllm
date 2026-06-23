@@ -6,30 +6,17 @@ use thiserror_ext::{Construct, Macro};
 
 use crate::routes::openai::utils::types::{ErrorDetail, ErrorResponse};
 
-/// A specific kind of invalid request, mapped to a stable OpenAI error code.
-#[derive(Debug, Clone, Copy)]
-pub enum InvalidRequestKind {
-    ContextLengthExceeded,
-}
-
-impl InvalidRequestKind {
-    fn as_openai_code(&self) -> &'static str {
-        match self {
-            Self::ContextLengthExceeded => "context_length_exceeded",
-        }
-    }
-}
-
 /// Small OpenAI-style error family used by the minimal HTTP layer.
 #[derive(Debug, Construct, Macro)]
 pub enum ApiError {
     /// The request is syntactically valid OpenAI JSON but asks for unsupported
-    /// behavior. `kind` refines the OpenAI `code`; `None` is generic.
+    /// behavior.
     InvalidRequest {
         message: String,
         param: Option<&'static str>,
-        kind: Option<InvalidRequestKind>,
     },
+    /// The prompt (plus requested output) exceeds the model's context length.
+    ContextLengthExceeded { message: String },
     /// The requested model name does not match the single configured model.
     ModelNotFound { model: String },
     /// The request body could not be parsed as valid JSON.
@@ -43,6 +30,7 @@ impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::ContextLengthExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::ModelNotFound { .. } => StatusCode::NOT_FOUND,
             Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::JsonParseError { .. } => StatusCode::BAD_REQUEST,
@@ -53,20 +41,17 @@ impl ApiError {
     /// payload.
     pub fn to_error_response(&self) -> ErrorResponse {
         let error = match self {
-            Self::InvalidRequest {
-                message,
-                param,
-                kind,
-            } => ErrorDetail {
+            Self::InvalidRequest { message, param } => ErrorDetail {
                 message: message.clone(),
                 error_type: "invalid_request_error".to_string(),
                 param: param.map(|p| p.to_string()),
-                code: Some(
-                    kind.as_ref()
-                        .map(InvalidRequestKind::as_openai_code)
-                        .unwrap_or("invalid_request_error")
-                        .to_string(),
-                ),
+                code: Some("invalid_request_error".to_string()),
+            },
+            Self::ContextLengthExceeded { message } => ErrorDetail {
+                message: message.clone(),
+                error_type: "invalid_request_error".to_string(),
+                param: None,
+                code: Some("context_length_exceeded".to_string()),
             },
             Self::ModelNotFound { model } => ErrorDetail {
                 message: format!("The model `{model}` does not exist."),
@@ -104,7 +89,7 @@ impl IntoResponse for ApiError {
 /// Python frontend. Everything else stays an internal 500.
 pub fn text_submit_error(context: &'static str, error: vllm_text::Error) -> ApiError {
     if let vllm_text::Error::PromptTooLong { .. } = &error {
-        return invalid_request!(kind = InvalidRequestKind::ContextLengthExceeded, "{error}");
+        return ApiError::context_length_exceeded(format!("{error}"));
     }
     if is_prompt_validation_error(&error) {
         return invalid_request!("{error}");
@@ -118,7 +103,7 @@ pub fn chat_submit_error(context: &'static str, error: vllm_chat::Error) -> ApiE
     match &error {
         vllm_chat::Error::PromptTooLong { .. }
         | vllm_chat::Error::Text(vllm_text::Error::PromptTooLong { .. }) => {
-            invalid_request!(kind = InvalidRequestKind::ContextLengthExceeded, "{error}")
+            ApiError::context_length_exceeded(format!("{error}"))
         }
         vllm_chat::Error::Text(text_error) if is_prompt_validation_error(text_error) => {
             invalid_request!("{error}")
