@@ -275,6 +275,13 @@ jobs:
           #     tokenizer files, not weights, and run no inference. This is the
           #     coverage the offline-only restriction previously had to skip.
           #
+          # (e) bf-additive: the OpenAI structured error-code surface (bf-patch).
+          #     create_error_response + renderer validators (pure-Python / mock
+          #     tokenizer) plus MagicMock-engine serving tests (serving-models,
+          #     responses errors, lora resolvers) — no GPU, no weights, no server
+          #     launch. They guard the context_length_exceeded code and the
+          #     ErrorResponse/.error.status_code contract.
+          #
           # NOTE (ADR-0007 curated-set drift): the upstream sync that landed on
           # main moved/removed two files this list used to point at
           # (test_minimax_m3_reasoning_parser.py and test_structural_tag_registry.py);
@@ -323,6 +330,11 @@ jobs:
             tests/reasoning/test_minimax_m2_reasoning_parser.py
             tests/tool_parsers/test_hermes_tool_parser.py
             tests/tool_parsers/test_llama3_json_tool_parser.py
+            tests/entrypoints/serve/utils/test_error_response.py
+            tests/entrypoints/serve/lora/test_serving_models.py
+            tests/entrypoints/openai/responses/test_errors.py
+            tests/entrypoints/openai/completion/test_lora_resolvers.py
+            tests/renderers/test_completions.py
           # Per-test deselects (kept narrow — deselect the one broken case, not
           # the whole file, so the rest of the file's coverage stays):
           #   test_precompiled_install_flags_are_orthogonal asserts that setting
