@@ -67,7 +67,7 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
             content=generator.model_dump(mode="json", by_alias=True),
-            status_code=generator.error.code,
+            status_code=generator.error.status_code,
         )
     elif isinstance(generator, ResponsesResponse):
         return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
@@ -98,7 +98,7 @@ async def retrieve_responses(
     if isinstance(response, ErrorResponse):
         return JSONResponse(
             content=response.model_dump(mode="json", by_alias=True),
-            status_code=response.error.code,
+            status_code=response.error.status_code,
         )
     elif isinstance(response, ResponsesResponse):
         return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
@@ -119,7 +119,7 @@ async def cancel_responses(response_id: str, raw_request: Request):
     if isinstance(response, ErrorResponse):
         return JSONResponse(
             content=response.model_dump(mode="json", by_alias=True),
-            status_code=response.error.code,
+            status_code=response.error.status_code,
         )
     return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
 

@@ -46,7 +46,7 @@ def attach_router(app: FastAPI):
         response = await handler.load_lora_adapter(request)
         if isinstance(response, ErrorResponse):
             return JSONResponse(
-                content=response.model_dump(), status_code=response.error.code
+                content=response.model_dump(), status_code=response.error.status_code
             )
 
         return Response(status_code=200, content=response)
@@ -66,7 +66,7 @@ def attach_router(app: FastAPI):
         response = await handler.unload_lora_adapter(request)
         if isinstance(response, ErrorResponse):
             return JSONResponse(
-                content=response.model_dump(), status_code=response.error.code
+                content=response.model_dump(), status_code=response.error.status_code
             )
 
         return Response(status_code=200, content=response)

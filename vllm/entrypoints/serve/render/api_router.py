@@ -53,7 +53,9 @@ async def render_chat_completion(request: ChatCompletionRequest, raw_request: Re
     result = await handler.render_chat_request(request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return JSONResponse(
+            content=result.model_dump(), status_code=result.error.status_code
+        )
 
     return JSONResponse(content=result.model_dump())
 
@@ -76,7 +78,9 @@ async def render_completion(request: CompletionRequest, raw_request: Request):
     result = await handler.render_completion_request(request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return JSONResponse(
+            content=result.model_dump(), status_code=result.error.status_code
+        )
 
     return JSONResponse(content=[item.model_dump() for item in result])
 
@@ -101,7 +105,9 @@ async def derender_chat_completion(request: DerenderChatRequest, raw_request: Re
     result = await handler.derender_chat_response(request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return JSONResponse(
+            content=result.model_dump(), status_code=result.error.status_code
+        )
 
     return JSONResponse(content=result.model_dump())
 
@@ -124,7 +130,9 @@ async def derender_completion(request: DerenderCompletionRequest, raw_request: R
     result = await handler.derender_completion_response(request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return JSONResponse(
+            content=result.model_dump(), status_code=result.error.status_code
+        )
 
     return JSONResponse(content=result.model_dump())
 

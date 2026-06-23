@@ -42,7 +42,7 @@ def translate_error_response(response: ErrorResponse) -> JSONResponse:
         )
     )
     return JSONResponse(
-        status_code=response.error.code, content=anthropic_error.model_dump()
+        status_code=response.error.status_code, content=anthropic_error.model_dump()
     )
 
 

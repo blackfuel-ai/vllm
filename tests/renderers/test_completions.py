@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm.config import ModelConfig
+from vllm.exceptions import APIErrorCode, VLLMValidationError
 from vllm.inputs import SingletonPrompt
 from vllm.renderers import TokenizeParams
 from vllm.renderers.hf import HfRenderer
@@ -279,13 +280,15 @@ class TestRenderPrompt:
         )
 
         with pytest.raises(
-            ValueError,
+            VLLMValidationError,
             match="maximum context length is",
-        ):
+        ) as excinfo:
             renderer.tokenize_prompts(
                 prompts,
                 TokenizeParams(max_total_tokens=100),
             )
+
+        assert excinfo.value.error_code is APIErrorCode.CONTEXT_LENGTH_EXCEEDED
 
         # Should not even attempt tokenization
         assert renderer.tokenizer._captured_encode_kwargs == {}
@@ -321,13 +324,15 @@ class TestRenderPrompt:
         )
 
         with pytest.raises(
-            ValueError,
+            VLLMValidationError,
             match="maximum context length is",
-        ):
+        ) as excinfo:
             renderer.tokenize_prompts(
                 prompts,
                 TokenizeParams(max_total_tokens=100, truncate_prompt_tokens=None),
             )
+
+        assert excinfo.value.error_code is APIErrorCode.CONTEXT_LENGTH_EXCEEDED
 
     def test_no_tokenizer_for_text(self):
         renderer = _build_renderer(MockModelConfig(skip_tokenizer_init=True))

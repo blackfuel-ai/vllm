@@ -78,7 +78,7 @@ async def test_load_lora_adapter_missing_fields():
     response = await serving_models.load_lora_adapter(request)
     assert isinstance(response, ErrorResponse)
     assert response.error.type == "InvalidUserInput"
-    assert response.error.code == HTTPStatus.BAD_REQUEST
+    assert response.error.status_code == HTTPStatus.BAD_REQUEST
 
 
 @pytest.mark.asyncio
@@ -97,7 +97,7 @@ async def test_load_lora_adapter_duplicate():
     response = await serving_models.load_lora_adapter(request)
     assert isinstance(response, ErrorResponse)
     assert response.error.type == "InvalidUserInput"
-    assert response.error.code == HTTPStatus.BAD_REQUEST
+    assert response.error.status_code == HTTPStatus.BAD_REQUEST
     assert len(serving_models.lora_requests) == 1
 
 
@@ -123,7 +123,7 @@ async def test_unload_lora_adapter_missing_fields():
     response = await serving_models.unload_lora_adapter(request)
     assert isinstance(response, ErrorResponse)
     assert response.error.type == "InvalidUserInput"
-    assert response.error.code == HTTPStatus.BAD_REQUEST
+    assert response.error.status_code == HTTPStatus.BAD_REQUEST
 
 
 @pytest.mark.asyncio
@@ -133,7 +133,7 @@ async def test_unload_lora_adapter_not_found():
     response = await serving_models.unload_lora_adapter(request)
     assert isinstance(response, ErrorResponse)
     assert response.error.type == "NotFoundError"
-    assert response.error.code == HTTPStatus.NOT_FOUND
+    assert response.error.status_code == HTTPStatus.NOT_FOUND
 
 
 class _ConcretePoolingServing(PoolingServingBase):

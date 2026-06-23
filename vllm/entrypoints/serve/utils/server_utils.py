@@ -364,7 +364,7 @@ async def engine_error_handler(
         engine=req.app.state.engine_client,
     )
     err = create_error_response(exc)
-    return JSONResponse(err.model_dump(), status_code=err.error.code)
+    return JSONResponse(err.model_dump(), status_code=err.error.status_code)
 
 
 async def generation_error_handler(req: Request, exc: GenerationError):
@@ -375,7 +375,7 @@ async def generation_error_handler(req: Request, exc: GenerationError):
     server logs with stack traces.
     """
     err = create_error_response(exc)
-    return JSONResponse(err.model_dump(), status_code=err.error.code)
+    return JSONResponse(err.model_dump(), status_code=err.error.status_code)
 
 
 async def exception_handler(req: Request, exc: Exception):
@@ -388,7 +388,7 @@ async def exception_handler(req: Request, exc: Exception):
         )
 
     err = create_error_response(exc)
-    return JSONResponse(err.model_dump(), status_code=err.error.code)
+    return JSONResponse(err.model_dump(), status_code=err.error.status_code)
 
 
 async def http_exception_handler(req: Request, exc: HTTPException):
@@ -403,7 +403,7 @@ async def http_exception_handler(req: Request, exc: HTTPException):
         error=ErrorInfo(
             message=sanitize_message(exc.detail),
             type=HTTPStatus(exc.status_code).phrase,
-            code=exc.status_code,
+            status_code=exc.status_code,
         )
     )
     return JSONResponse(err.model_dump(), status_code=exc.status_code)
@@ -439,7 +439,7 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
         error=ErrorInfo(
             message=sanitize_message(message),
             type=HTTPStatus.BAD_REQUEST.phrase,
-            code=HTTPStatus.BAD_REQUEST,
+            status_code=HTTPStatus.BAD_REQUEST.value,
             param=param,
         )
     )

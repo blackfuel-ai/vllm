@@ -51,7 +51,7 @@ async def create_translations(
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
+            content=generator.model_dump(), status_code=generator.error.status_code
         )
 
     elif isinstance(generator, TranslationResponseVariant):

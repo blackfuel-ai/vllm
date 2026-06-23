@@ -53,7 +53,7 @@ async def tokenize(request: TokenizeRequest, raw_request: Request):
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
+            content=generator.model_dump(), status_code=generator.error.status_code
         )
     elif isinstance(generator, TokenizeResponse):
         return JSONResponse(content=generator.model_dump())
@@ -85,7 +85,7 @@ async def detokenize(request: DetokenizeRequest, raw_request: Request):
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
+            content=generator.model_dump(), status_code=generator.error.status_code
         )
     elif isinstance(generator, DetokenizeResponse):
         return JSONResponse(content=generator.model_dump())
@@ -103,7 +103,7 @@ def attach_router(app: FastAPI):
             result = await tokenization(raw_request).get_tokenizer_info()
             return JSONResponse(
                 content=result.model_dump(),
-                status_code=result.error.code
+                status_code=result.error.status_code
                 if isinstance(result, ErrorResponse)
                 else 200,
             )

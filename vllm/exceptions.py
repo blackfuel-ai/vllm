@@ -3,7 +3,17 @@
 
 """Custom exceptions for vLLM."""
 
+from enum import Enum
 from typing import Any
+
+
+class APIErrorCode(Enum):
+    """Stable OpenAI-style error codes for the `code` field of error responses.
+
+    The HTTP status is owned by the raising exception class, not by this enum.
+    """
+
+    CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
 
 
 class VLLMValidationError(ValueError):
@@ -13,6 +23,7 @@ class VLLMValidationError(ValueError):
         message: The error message describing the validation failure.
         parameter: Optional parameter name that failed validation.
         value: Optional value that was rejected during validation.
+        error_code: Optional stable OpenAI-style error code.
     """
 
     def __init__(
@@ -21,10 +32,12 @@ class VLLMValidationError(ValueError):
         *,
         parameter: str | None = None,
         value: Any = None,
+        error_code: APIErrorCode | None = None,
     ) -> None:
         super().__init__(message)
         self.parameter = parameter
         self.value = value
+        self.error_code = error_code
 
     def __str__(self):
         base = super().__str__()

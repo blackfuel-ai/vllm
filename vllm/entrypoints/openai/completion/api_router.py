@@ -55,7 +55,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
+            content=generator.model_dump(), status_code=generator.error.status_code
         )
     elif isinstance(generator, CompletionResponse):
         return JSONResponse(
