@@ -22,9 +22,10 @@
 #      the upstream tag commit is reachable from the release ref on main.
 #   2. Resolve the release ref on `main` (default: current main HEAD).
 #   3. Run the curated CI (the bf-precommit suite) on the release ref.
-#   4. [TODO] Dispatch the per-arch `release`-channel image builds. DEFERRED:
-#      those become thin callers of the consolidated reusable build core
-#      (bf-build-image.yml), which does not exist yet. See the step below.
+#   4. Dispatch the per-arch `release`-channel image builds — an explicit
+#      matrix (the dispatch-builds job) with one row per target
+#      (nvidia/rocm/cpu/cpu-bench), each carrying its own build workflow and,
+#      for nvidia, the CUDA arch list. image_targets subsets which rows fire.
 #   5. Create the annotated git tag v<upstream>+bf.<bf> (via version.py) and
 #      push it with the bf-vllm-sync App token.
 #   6. Generate the release notes (bf-tools/generate-release-notes.py) and
@@ -81,6 +82,10 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Surface the resolved release identity to the dispatch-builds job below.
+    outputs:
+      git_tag: ${{ steps.resolve.outputs.git_tag }}
+      release_ref: ${{ steps.resolve.outputs.release_ref }}
     steps:
       - name: Mint bf-vllm-sync App token
         id: app-token
@@ -183,6 +188,13 @@ jobs:
           echo "git_tag=${GIT_TAG}" >> "$GITHUB_OUTPUT"
           IMAGE_TAG="$(python -c 'import sys; sys.path.insert(0,"bf-tools"); from version import to_image_tag; print(to_image_tag(sys.argv[1]))' "$GIT_TAG")"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          # Surface the resolved (possibly auto-derived) upstream tag and the BF
+          # SemVer so the Slack card can field them without re-deriving — the
+          # workflow inputs may be blank when auto-derived.
+          {
+            echo "upstream_tag=${UPSTREAM_TAG}"
+            echo "bf_version=${BF_VERSION}"
+          } >> "$GITHUB_OUTPUT"
 
           # --- the release tag must not already exist (no clobbering a release).
           if git rev-parse -q --verify "refs/tags/${GIT_TAG}" >/dev/null; then
@@ -265,42 +277,6 @@ jobs:
           set -euo pipefail
           pre-commit run --all-files --hook-stage manual
 
-      - name: "[TODO] Dispatch release-channel image builds (DEFERRED)"
-        env:
-          GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
-          IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
-          IMAGE_TARGETS: ${{ github.event.inputs.image_targets }}
-          RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
-        run: |
-          set -euo pipefail
-          # ----------------------------------------------------------------
-          # TODO(consolidation): dispatch the per-arch RELEASE-channel image
-          # builds here once the reusable build core exists.
-          #
-          # These builds are intentionally NOT implemented in this PR. They
-          # must become thin callers of a single consolidated reusable
-          # workflow (bf-build-image.yml) — the "build consolidation"
-          # workstream queued after build validation. Writing release build
-          # steps now would be a 5th/6th copy of the build mechanics right
-          # before that consolidation, so they are deferred.
-          #
-          # When wired, this step dispatches one build per IMAGE_TARGETS entry
-          # (default: nvidia,rocm,cpu,cpu-bench), each building from
-          # RELEASE_REF and publishing the `release` channel per ADR-0004:
-          #   - immutable tag:  ${IMAGE_TAG}              (e.g. 0.20.2_bf.0.1.0)
-          #   - moving tag:     <upstream>_bf-latest      (newest BF release on the line)
-          #   - moving tag:     bf-stable                 (moved by engine after bake)
-          #   OCI labels: ai.bf-vllm.build.channel=release,
-          #               ai.bf-vllm.bf.version=<bf semver>,
-          #               ai.bf-vllm.image.tag=${IMAGE_TAG}, plus the standard
-          #               org.opencontainers.image.* / ai.vllm.* set (ADR-0004 §8b).
-          # The future callers (bf-build-{nvidia,rocm,cpu,cpu-bench}-image.yml,
-          # release channel) are dispatched via:
-          #   gh workflow run bf-build-<arch>-image.yml --ref main \
-          #     -f channel=release -f release_ref="$RELEASE_REF" \
-          #     -f git_tag="$GIT_TAG"
-          # ----------------------------------------------------------------
-          echo "::notice::Release-channel image builds for ${GIT_TAG} (targets: ${IMAGE_TARGETS}) are DEFERRED to the build-consolidation PR — no images built by this run."
 
       - name: Create and push the annotated release tag
         id: tag
@@ -368,41 +344,162 @@ jobs:
         # is more important to surface than a clean one, and silent CI failure is
         # exactly what we want to avoid. Gated only on the shared bot token
         # (GitHub forbids `secrets` in a step `if:`, so read the job-level env).
-        # Branches on job.status; GIT_TAG/IMAGE_TAG may be empty if the run failed
-        # before the resolve step, so the message degrades gracefully. Same
-        # bot-token + Block Kit pattern as bf-sync-upstream and bf-build-notify.
+        # Same bot-token + Block Kit + chat.postMessage convention as
+        # bf-sync-upstream and the bf-build-notify action.
+        #
+        # The message is a structured Block Kit card mirroring ai-platform's
+        # deploy/release cards:
+        #   header  — ":rocket: bf-vllm <version> released" (success) /
+        #             ":x: bf-vllm release FAILED — <version>" (failure).
+        #   section.fields — a two-column grid of release facts (Version,
+        #             Upstream tag/commit, BF version, Channel, Image tags,
+        #             Actor, Status). Each is taken from the resolve step's
+        #             outputs; any may be empty if the run failed before resolve,
+        #             so every field degrades to "—" rather than breaking.
+        #   section  — "What's Changed": the head of the GitHub release body
+        #             (bf-tools/generate-release-notes.py output, lightly mapped
+        #             from GitHub markdown to Slack mrkdwn and truncated to the
+        #             3000-char block limit with a link out). Present only on a
+        #             successful release, where release-notes.md exists.
+        #   actions  — "View Release" + "View Run" buttons (View Run is styled
+        #             danger on failure); the release button is omitted when no
+        #             release was created.
+        #   context  — "Triggered by <actor> | <run>".
+        # jq builds the JSON so every dynamic field is escaped; --slurpfile feeds
+        # the optional changelog block array in (empty on failure).
         if: ${{ always() && env.SLACK_BOT_TOKEN != '' }}
         env:
           JOB_STATUS: ${{ job.status }}
           GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
           IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ steps.resolve.outputs.upstream_sha }}
+          BF_VERSION: ${{ steps.resolve.outputs.bf_version }}
+          IMAGE_TARGETS: ${{ github.event.inputs.image_targets }}
           REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
           CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           payload_file="$RUNNER_TEMP/slack-payload.json"
           tag_disp="${GIT_TAG:-(unresolved)}"
+          release_url="${GITHUB_SERVER_URL}/${REPO}/releases/tag/${GIT_TAG}"
+
+          # Backslash-escape Slack mrkdwn formatting chars in the actor login so
+          # an underscore/asterisk in a username renders literally instead of as
+          # italic/bold. jq --arg already prevents JSON injection; this is the
+          # separate mrkdwn layer.
+          actor_disp="$(printf '%s' "${ACTOR:-—}" | sed -E 's/([*_~`])/\\\1/g')"
+
+          # Image-tag pull strings, one per arch target the release builds (the
+          # same GHCR repos generate-release-notes.py renders). Shown as the tags
+          # the release WILL publish — release-channel image builds are still
+          # deferred in this workflow (see the DEFERRED step above), so they are
+          # marked pending rather than claimed as pushed.
+          images_field="—"
+          if [ -n "${IMAGE_TAG:-}" ]; then
+            lines=""
+            IFS=',' read -ra targets <<< "${IMAGE_TARGETS:-nvidia,rocm,cpu,cpu-bench}"
+            for t in "${targets[@]}"; do
+              t="$(echo "$t" | tr -d '[:space:]')"
+              case "$t" in
+                nvidia)   image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm" ;;
+                rocm)     image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm" ;;
+                cpu)      image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu" ;;
+                cpu-bench) image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu-bench" ;;
+                *)        image_repo="" ;;
+              esac
+              if [ -n "$image_repo" ]; then
+                lines+="\`${image_repo}:${IMAGE_TAG}\`"$'\n'
+              fi
+            done
+            [ -n "$lines" ] && images_field="${lines%$'\n'} _(pending build)_"
+          fi
+
+          upstream_field="\`${UPSTREAM_TAG:-—}\`"
+          if [ -n "${UPSTREAM_SHA:-}" ]; then
+            upstream_field="${upstream_field} (\`${UPSTREAM_SHA:0:12}\`)"
+          fi
+
           if [ "$JOB_STATUS" = "success" ]; then
-            release_url="${GITHUB_SERVER_URL}/${REPO}/releases/tag/${GIT_TAG}"
             header=":rocket: bf-vllm ${tag_disp} released"
-            summary="Image tag \`${IMAGE_TAG:-—}\` · <${release_url}|release notes>"
             text="bf-vllm ${tag_disp} released"
           else
             header=":x: bf-vllm release FAILED — ${tag_disp}"
-            summary="The release run did not complete (status: \`${JOB_STATUS}\`). No GitHub release was created. Check the run for the failing step."
             text="bf-vllm release ${tag_disp} FAILED"
           fi
-          # jq builds valid JSON and escapes every dynamic field (tag, emoji).
-          jq -n --arg channel "$CHANNEL" --arg h "$header" --arg s "$summary" \
-            --arg text "$text" --arg run "$RUN_URL" '
+
+          # "What's Changed" block — only on a successful release, where the
+          # GitHub release body (release-notes.md) was generated above. Map the
+          # generator's GitHub markdown to Slack mrkdwn (headings -> bold,
+          # [text](url) -> <url|text>, list bullets kept) and truncate to the
+          # 3000-char block limit, linking out to the full release for the rest.
+          changelog_blocks="[]"
+          if [ "$JOB_STATUS" = "success" ] && [ -f release-notes.md ]; then
+            md="$(
+              sed -E \
+                -e 's/^#{1,6}[[:space:]]+(.*[^[:space:]])[[:space:]]*$/*\1*/' \
+                -e 's/\[([^]]+)\]\(([^)]+)\)/<\2|\1>/g' \
+                release-notes.md
+            )"
+            limit=2800
+            if [ "${#md}" -gt "$limit" ]; then
+              md="${md:0:$limit}…"$'\n\n'"<${release_url}|View the full release on GitHub>"
+            fi
+            changelog_blocks="$(
+              jq -n --arg md "$md" \
+                '[ {type:"section",text:{type:"mrkdwn",text:("*What'"'"'s Changed*\n"+$md)}} ]'
+            )"
+          fi
+          printf '%s' "$changelog_blocks" > "$RUNNER_TEMP/changelog.json"
+
+          # Action buttons: View Release (omitted if no release was created) and
+          # View Run (danger-styled on failure, like ai-platform's failure card).
+          action_elems="$(
+            jq -n --arg run "$RUN_URL" --arg rel "$release_url" \
+              --arg status "$JOB_STATUS" --arg have_rel "${GIT_TAG:+yes}" '
+              ( if $have_rel == "yes"
+                  then [{type:"button",text:{type:"plain_text",text:"View Release",emoji:true},url:$rel}]
+                  else [] end )
+              + [ ( {type:"button",text:{type:"plain_text",text:"View Run",emoji:true},url:$run}
+                    + (if $status == "success" then {} else {style:"danger"} end) ) ]'
+          )"
+
+          jq -n \
+            --arg channel "$CHANNEL" \
+            --arg text "$text" \
+            --arg h "$header" \
+            --arg version "$tag_disp" \
+            --arg upstream "$upstream_field" \
+            --arg bf "${BF_VERSION:-—}" \
+            --arg images "$images_field" \
+            --arg actor "$actor_disp" \
+            --arg status "$JOB_STATUS" \
+            --arg run "$RUN_URL" \
+            --argjson actions "$action_elems" \
+            --slurpfile changelog "$RUNNER_TEMP/changelog.json" '
             { channel: $channel,
               text: $text,
-              blocks: [
+              blocks: ( [
                 {type:"header",text:{type:"plain_text",text:$h,emoji:true}},
-                {type:"section",text:{type:"mrkdwn",text:$s}},
-                {type:"context",elements:[{type:"mrkdwn",text:("<"+$run+"|workflow run>")}]}
-              ] }' > "$payload_file"
+                {type:"section",fields:[
+                  {type:"mrkdwn",text:("*Version:*\n`"+$version+"`")},
+                  {type:"mrkdwn",text:("*Upstream:*\n"+$upstream)},
+                  {type:"mrkdwn",text:("*BF version:*\n`"+$bf+"`")},
+                  {type:"mrkdwn",text:("*Channel:*\n`release`")},
+                  {type:"mrkdwn",text:("*Status:*\n`"+$status+"`")},
+                  {type:"mrkdwn",text:("*Actor:*\n"+$actor)},
+                  {type:"mrkdwn",text:("*Image tags:*\n"+$images)}
+                ]}
+              ]
+              + $changelog[0]
+              + [
+                {type:"actions",elements:$actions},
+                {type:"context",elements:[
+                  {type:"mrkdwn",text:("Triggered by "+$actor+" | <"+$run+"|workflow run>")}
+                ]}
+              ] ) }' > "$payload_file"
           echo "payload_file=${payload_file}" >> "$GITHUB_OUTPUT"
 
       - name: Notify Slack
@@ -418,3 +515,98 @@ jobs:
           # release's notification when the bot was not yet in the channel. Surface
           # it instead so a misconfigured channel/token is visible, not silent.
           errors: true
+
+  # Dispatch the per-arch release-channel image builds as an explicit matrix —
+  # one row per target, each carrying its own workflow file (and, for nvidia,
+  # the CUDA arch list). The grid is visible here rather than hidden in a bash
+  # loop, so a release run shows exactly what is triggered. The per-provider
+  # build mechanics stay in their own bf-build-<target>-image.yml (ADR: four
+  # separate per-provider files, no monolith); this job only fans out to them.
+  dispatch-builds:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One row per release image target. `name` is matched against the
+    # image_targets input so the operator can subset a release; `workflow` is
+    # the per-provider build file; `arch_list` is forwarded to nvidia only when
+    # non-empty (empty = nvidia's own default; the other providers take no arch
+    # input). Add a target by adding a row.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nvidia
+            workflow: bf-build-nvidia-image.yml
+            # Empty = use the nvidia workflow's own default (9.0 10.0 = Hopper +
+            # Blackwell). Set e.g. "8.9 9.0 10.0" here to also bake Ada/L40S into
+            # the release image.
+            arch_list: ""
+          - name: rocm
+            workflow: bf-build-rocm-image.yml
+            arch_list: ""
+          - name: cpu
+            workflow: bf-build-cpu-image.yml
+            arch_list: ""
+          - name: cpu-bench
+            workflow: bf-build-cpu-bench-image.yml
+            arch_list: ""
+    steps:
+      - name: Mint bf-vllm-sync App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: Iv23liG4vLDpTNkt8CLs
+          private-key: ${{ secrets.BF_VLLM_SYNC_PRIVATE_KEY }}
+
+      - name: Dispatch ${{ matrix.name }} release build
+        # Skip rows the operator excluded via the image_targets input. The match
+        # is on the comma-delimited list so a substring (e.g. "cpu" in
+        # "cpu-bench") cannot false-match.
+        if: ${{ contains(format(',{0},', github.event.inputs.image_targets), format(',{0},', matrix.name)) }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ matrix.workflow }}
+          ARCH_LIST: ${{ matrix.arch_list }}
+          GIT_TAG: ${{ needs.release.outputs.git_tag }}
+          RELEASE_REF: ${{ needs.release.outputs.release_ref }}
+        run: |
+          set -euo pipefail
+          # Defence-in-depth: although git_tag / release_ref are produced by the
+          # release job (version.py-validated tag, `git rev-parse main` SHA) and
+          # not free external input, reject any value that could be read as a
+          # flag before it reaches `gh`. `gh ... -f key=value` already treats the
+          # value literally, but a leading `-` is refused here so the dispatch
+          # can never be steered by a `--`-prefixed value.
+          for v in "$GIT_TAG" "$RELEASE_REF" "$ARCH_LIST"; do
+            case "$v" in
+              -*) echo "::error::refusing dispatch: value '${v}' starts with '-'." >&2; exit 1 ;;
+            esac
+          done
+
+          # Distinguish "workflow absent" from a transient gh/auth error: capture
+          # stderr instead of discarding it, so a network/permission failure is
+          # surfaced rather than wrongly reported as a missing target.
+          if ! view_err="$(gh workflow view "$WORKFLOW" --repo "$REPO" 2>&1 >/dev/null)"; then
+            if printf '%s' "$view_err" | grep -qi 'could not find\|not found\|HTTP 404'; then
+              echo "::error::release target workflow ${WORKFLOW} not found in ${REPO}." >&2
+            else
+              printf 'gh workflow view failed: %s\n' "$view_err" >&2
+              echo "::error::could not query ${WORKFLOW} (not a not-found error); see the log above." >&2
+            fi
+            exit 1
+          fi
+
+          # nvidia takes an arch_list input; the other providers do not, so the
+          # flag is only added when a non-empty arch_list is present.
+          arch_arg=()
+          if [ -n "$ARCH_LIST" ]; then
+            arch_arg=(-f "arch_list=$ARCH_LIST")
+          fi
+          # --ref main: the workflow DEFINITION runs from main; the source it
+          # builds is the release ref passed as the `ref` input. The build
+          # derives its image tag from git_tag via bf-tools/version.py.
+          gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
+            -f channel=release -f ref="$RELEASE_REF" -f git_tag="$GIT_TAG" \
+            "${arch_arg[@]}"
+          echo "::notice::Dispatched ${WORKFLOW} (channel=release ref=${RELEASE_REF} git_tag=${GIT_TAG}${ARCH_LIST:+ arch_list=${ARCH_LIST}})"

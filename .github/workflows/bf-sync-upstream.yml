@@ -97,11 +97,15 @@ env:
   # notify step. Channel #bot-bf-vllm-sync; the bot must be a member of it.
   SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
   SLACK_CHANNEL_ID: C0BAGEB5FST
-  # The from-upstream image builds the sync triggers after a successful run.
+  # The upstream-channel image builds the sync triggers after a successful run.
+  # All three are channel-aware now, dispatched with channel=upstream; the
+  # per-workflow-name case in the dispatch step still tolerates a legacy
+  # *-from-upstream workflow (upstream_ref input) so a future provider can be
+  # added without lockstep, but none remain.
   BUILD_WORKFLOWS: >-
-    bf-build-nvidia-image-from-upstream.yml
-    bf-build-cpu-image-from-upstream.yml
-    bf-build-rocm-image-from-upstream.yml
+    bf-build-nvidia-image.yml
+    bf-build-cpu-image.yml
+    bf-build-rocm-image.yml
 
 jobs:
   sync:
@@ -376,9 +380,9 @@ jobs:
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "number=$number" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch from-upstream image builds
+      - name: Dispatch upstream-channel image builds
         # Only when the sync succeeded cleanly and upstream actually advanced —
-        # no point rebuilding :upstream-latest if nothing changed or a human
+        # no point rebuilding the upstream image if nothing changed or a human
         # still has to resolve the merge.
         if: steps.upstream.outputs.changed == 'true' && steps.merge.outputs.conflict == 'false'
         env:
@@ -386,19 +390,33 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # --ref main: the workflow DEFINITION to run lives on main (the
-          # bf-build-* files do not exist on upstream-main, which is bare
-          # upstream). upstream_ref=upstream-main is the input — the source the
-          # build checks out — so a fresh :upstream-latest is built each sync.
+          # --ref main: the workflow DEFINITION lives on main (the bf-build-*
+          # files do not exist on upstream-main, which is bare upstream). The
+          # source the build checks out is upstream-main, so a fresh upstream
+          # image is built each sync.
+          #
+          # Input shape differs during the channel migration: the channel-aware
+          # builds take `-f channel=upstream -f ref=…`, the legacy from-upstream
+          # builds take `-f upstream_ref=…`. Select by workflow name so both can
+          # be dispatched from one loop until all four have migrated.
           for wf in $BUILD_WORKFLOWS; do
-            if gh workflow view "$wf" --repo "$REPO" >/dev/null 2>&1; then
-              echo "Dispatching $wf (upstream_ref=upstream-main)"
-              gh workflow run "$wf" --repo "$REPO" --ref main -f upstream_ref=upstream-main
-            else
-              # ROCm (bf-build-rocm-image-from-upstream.yml) may not be merged
-              # yet; skip cleanly rather than fail the sync.
+            if ! gh workflow view "$wf" --repo "$REPO" >/dev/null 2>&1; then
+              # A workflow may not be merged yet; skip cleanly rather than fail.
               echo "::notice::$wf not present yet — skipping dispatch."
+              continue
             fi
+            case "$wf" in
+              *-from-upstream.yml)
+                echo "Dispatching $wf (upstream_ref=upstream-main)"
+                gh workflow run "$wf" --repo "$REPO" --ref main \
+                  -f upstream_ref=upstream-main
+                ;;
+              *)
+                echo "Dispatching $wf (channel=upstream ref=upstream-main)"
+                gh workflow run "$wf" --repo "$REPO" --ref main \
+                  -f channel=upstream -f ref=upstream-main
+                ;;
+            esac
           done
 
       - name: Compute the release nudge

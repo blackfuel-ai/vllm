@@ -126,7 +126,7 @@ Three image channels, each with a distinct consumer:
 
 - **`release`** — `ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm:0.20.2_bf.0.1.0`. Reviewed, blessed, what production pulls.
 - **`upstream`** — its own repository `ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-rocm`, bare vLLM-identical tags (`:latest`, `:vX.Y.Z`, `:sha-<short>`). Built off bare `upstream-main` on every sync. Fast-path for new-model availability — preview deployments use this. Routed by repository path, not by label (ADR-0004 amendment).
-- **`dev`** — `:dev-pr-N-<sha>`. Per-PR builds for testing in staging.
+- **`dev`** — shared repository `ghcr.io/blackfuel-ai/bf-vllm/vllm-<arch>`, label-routed (`ai.bf-vllm.build.channel=dev`), never auto-deployed. Per-PR builds tag `:dev-pr-N-<sha>`; a manual dev build tags `:<base-version>-dev-<sha7>` (e.g. `:v0.23.1rc0_bf.0.1.0-dev-aebd933`), the tree's clean `git describe` base plus the commit (bare sha7, no git-describe `g` prefix), so the engine — which shows the tag verbatim — displays a version, not a bare sha. `bf-tools/version.py:dev_image_tag()` derives it. See [ADR-0004](./adr/0004-build-channels-versioning-labels.md) 2026-06-22 dev-tag amendment.
 
 Versioning is `v<upstream-semver>+bf.<bf-semver>` (e.g. `v0.20.2+bf.0.1.0`). OCI image tag is the same string with `+` → `_` per OCI naming rules. See [ADR-0004](./adr/0004-build-channels-versioning-labels.md) for the full label schema (`org.opencontainers.image.*` + `ai.vllm.*` + `ai.bf-vllm.*`).
 
