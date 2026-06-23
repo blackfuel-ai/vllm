@@ -170,11 +170,23 @@ jobs:
               echo "::error::channel=release requires git_tag (e.g. v0.23.1rc0+bf.0.1.0)." >&2
               exit 1
             fi
+            # The git_tag value is never interpolated into a `::error::` workflow
+            # command — a value carrying a newline + a `::` directive could
+            # otherwise smuggle an arbitrary workflow command. The offending tag
+            # is echoed to stderr as plain text instead; `::error::` stays static.
             if ! bf_fields="$(python -c 'import sys; sys.path.insert(0, "bf-tools"); from version import parse_git_tag; v = parse_git_tag(sys.argv[1]); print(v.image_tag, v.bf, v.upstream)' "$GIT_TAG")"; then
-              echo "::error::git_tag '${GIT_TAG}' failed to parse via bf-tools/version.py (expected v<upstream>+bf.<bf>)." >&2
+              printf 'git_tag failed to parse: %q\n' "$GIT_TAG" >&2
+              echo "::error::git_tag failed to parse via bf-tools/version.py (expected v<upstream>+bf.<bf>); see the value logged above." >&2
               exit 1
             fi
             read -r bf_image_tag bf_version bf_upstream <<< "$bf_fields"
+            # Guard against a parse that exits 0 but yields blank fields: every
+            # release identity component must be non-empty or the build would
+            # push blank/underscore-only OCI tags.
+            if [ -z "$bf_image_tag" ] || [ -z "$bf_version" ] || [ -z "$bf_upstream" ]; then
+              echo "::error::release identity is incomplete (image_tag/bf/upstream); refusing to build with blank tags." >&2
+              exit 1
+            fi
           fi
 
           {
