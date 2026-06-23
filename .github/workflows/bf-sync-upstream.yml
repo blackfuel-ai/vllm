@@ -98,13 +98,14 @@ env:
   SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
   SLACK_CHANNEL_ID: C0BAGEB5FST
   # The upstream-channel image builds the sync triggers after a successful run.
-  # nvidia and cpu are channel-aware (dispatched with channel=upstream); rocm is
-  # still the legacy from-upstream workflow until its channel migration lands, so
-  # the dispatch step below selects the right input shape per workflow name.
+  # All three are channel-aware now, dispatched with channel=upstream; the
+  # per-workflow-name case in the dispatch step still tolerates a legacy
+  # *-from-upstream workflow (upstream_ref input) so a future provider can be
+  # added without lockstep, but none remain.
   BUILD_WORKFLOWS: >-
     bf-build-nvidia-image.yml
     bf-build-cpu-image.yml
-    bf-build-rocm-image-from-upstream.yml
+    bf-build-rocm-image.yml
 
 jobs:
   sync:
