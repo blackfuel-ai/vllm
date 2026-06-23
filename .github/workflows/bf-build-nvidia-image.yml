@@ -11,7 +11,7 @@
 #                     bare upstream. Pushed to the dedicated upstream repository
 #                     whose PATH is the channel signal (engine routes by repo,
 #                     not label):
-#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-nvidia:sha-<short>
+#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm:sha-<short>
 #                       …:vX.Y.Z   (upstream release tags only)
 #                       …:latest   (upstream-main only)
 #   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
@@ -19,8 +19,8 @@
 #                     BF-layered source, so it is checked into src/ as-is with NO
 #                     overlay. Pushed to the shared repository, label-routed and
 #                     never auto-deployed:
-#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-nvidia:<base-version>-dev-<sha7>
-#                     e.g. …/vllm-nvidia:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm:<base-version>-dev-<sha7>
+#                     e.g. …/vllm:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
 #                     embeds the clean base version (not a bare sha) because the
 #                     engine renders the image tag verbatim — a bare sha would
 #                     read as "no version" on the deployment page. The trailing
@@ -29,9 +29,9 @@
 #   channel=release   the bf-vllm tree at the release ref, tagged with the
 #                     canonical release version. Orchestrated by bf-release.yml,
 #                     which passes `git_tag`; this workflow only builds + pushes.
-#                       …/vllm-nvidia:<upstream>_bf.<bf>  (immutable release)
-#                       …/vllm-nvidia:<upstream>_bf-latest
-#                       …/vllm-nvidia:bf-stable
+#                       …/vllm:<upstream>_bf.<bf>  (immutable release)
+#                       …/vllm:<upstream>_bf-latest
+#                       …/vllm:bf-stable
 #
 # Caching (ADR-0005 amendment): sccache runs in local-disk mode, writing into
 # /sccache inside the build. That path is a BuildKit `type=cache` mount (id
@@ -73,6 +73,11 @@ on:
         type: string
         required: false
         default: ""
+      arch_list:
+        description: "CUDA arch list to compile (torch_cuda_arch_list). Default '9.0 10.0' = Hopper (H100/H200) + Blackwell (B200/B300), the Blackfuel production GPUs. Add 8.9 to also serve Ada/L40S in the same image."
+        type: string
+        required: false
+        default: "9.0 10.0"
 
 permissions:
   contents: read
@@ -119,9 +124,18 @@ jobs:
           CHANNEL: ${{ github.event.inputs.channel }}
           REF: ${{ github.event.inputs.ref }}
           GIT_TAG: ${{ github.event.inputs.git_tag }}
+          ARCH_LIST: ${{ github.event.inputs.arch_list }}
           OWNER_IMAGE: ghcr.io/blackfuel-ai/bf-vllm
         run: |
           set -euo pipefail
+          # arch_list flows into the Docker build as torch_cuda_arch_list, so
+          # constrain it to space-separated CUDA capability tokens (e.g.
+          # "8.9 9.0 10.0", optional letter suffix like 10.0a, optional +PTX)
+          # before it reaches the build-arg — no shell metacharacters can pass.
+          if ! printf '%s' "$ARCH_LIST" | grep -Eqx '([0-9]+\.[0-9]+[a-z]?(\+PTX)?)( [0-9]+\.[0-9]+[a-z]?(\+PTX)?)*'; then
+            echo "::error::arch_list '${ARCH_LIST}' is not a space-separated CUDA arch list (e.g. '8.9 9.0 10.0')." >&2
+            exit 1
+          fi
           # The source is checked out under src/ (the CUDA Dockerfile ingests it
           # as the build context), so every git query against it needs -C src.
           sha="$(git -C src rev-parse HEAD)"
@@ -140,11 +154,14 @@ jobs:
             upstream)
               # Dedicated upstream repository: the path is the channel signal
               # (ADR-0004 amendment), so tags stay bare and vLLM-identical.
-              image="${OWNER_IMAGE}/upstream/vllm-nvidia"
+              # NVIDIA is the unsuffixed default repo (vllm), not vllm-nvidia —
+              # the engine and generate-release-notes.py both reference it as
+              # `…/vllm`; only the other arches carry an arch suffix.
+              image="${OWNER_IMAGE}/upstream/vllm"
               ;;
             dev|release)
               # Shared repository, label-routed (ADR-0004).
-              image="${OWNER_IMAGE}/vllm-nvidia"
+              image="${OWNER_IMAGE}/vllm"
               ;;
             *)
               echo "::error::Unknown channel '${CHANNEL}'." >&2
@@ -323,15 +340,17 @@ jobs:
           #
           # torch_cuda_arch_list overrides the Dockerfile default
           # ('7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX') down to the hardware
-          # Blackfuel actually runs — Hopper (9.0: H100/H200) and Blackwell
-          # (10.0: B200/B300). This is ADR-0005 lever #2 (arch-list trim): each
-          # extra CUDA arch is a full nvcc pass, and the untrimmed list compiles
-          # ~452 CUDA objects in the csrc wheel — a cold build does not finish
-          # inside the runner limit. Trimming to 2 arches cuts that ~25-40%.
+          # Blackfuel actually runs, taken from the arch_list input (default
+          # '9.0 10.0': Hopper H100/H200 + Blackwell B200/B300). This is ADR-0005
+          # lever #2 (arch-list trim): each extra CUDA arch is a full nvcc pass,
+          # and the untrimmed 8-arch list compiles ~452 CUDA objects in the csrc
+          # wheel, which a cold build cannot finish in the runner limit. Trimming
+          # to the production arches keeps the build bounded; adding 8.9 (Ada/
+          # L40S) to the input serves that GPU from the same image when needed.
           build-args: |
             USE_SCCACHE=1
             SCCACHE_BUCKET_NAME=
-            torch_cuda_arch_list=9.0 10.0
+            torch_cuda_arch_list=${{ github.event.inputs.arch_list }}
 
       # Measure pushed image size, write the STEP_SUMMARY metrics table, and
       # post a Block Kit build summary to Slack — all in one shared composite
@@ -348,7 +367,7 @@ jobs:
           image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && steps.prov.outputs.dev_image_tag || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.short))) }}
           display-name: vllm-nvidia
           summary-title: NVIDIA ${{ steps.prov.outputs.channel }} build
-          arch-list: 9.0a 10.0a
+          arch-list: ${{ github.event.inputs.arch_list }}
           runner-default: blacksmith-32vcpu
           started-epoch: ${{ steps.started.outputs.epoch }}
           build-outcome: ${{ steps.build.outcome }}
