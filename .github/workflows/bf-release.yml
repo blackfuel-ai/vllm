@@ -22,9 +22,10 @@
 #      the upstream tag commit is reachable from the release ref on main.
 #   2. Resolve the release ref on `main` (default: current main HEAD).
 #   3. Run the curated CI (the bf-precommit suite) on the release ref.
-#   4. [TODO] Dispatch the per-arch `release`-channel image builds. DEFERRED:
-#      those become thin callers of the consolidated reusable build core
-#      (bf-build-image.yml), which does not exist yet. See the step below.
+#   4. Dispatch the per-arch `release`-channel image builds — an explicit
+#      matrix (the dispatch-builds job) with one row per target
+#      (nvidia/rocm/cpu/cpu-bench), each carrying its own build workflow and,
+#      for nvidia, the CUDA arch list. image_targets subsets which rows fire.
 #   5. Create the annotated git tag v<upstream>+bf.<bf> (via version.py) and
 #      push it with the bf-vllm-sync App token.
 #   6. Generate the release notes (bf-tools/generate-release-notes.py) and
@@ -81,6 +82,10 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Surface the resolved release identity to the dispatch-builds job below.
+    outputs:
+      git_tag: ${{ steps.resolve.outputs.git_tag }}
+      release_ref: ${{ steps.resolve.outputs.release_ref }}
     steps:
       - name: Mint bf-vllm-sync App token
         id: app-token
@@ -272,42 +277,6 @@ jobs:
           set -euo pipefail
           pre-commit run --all-files --hook-stage manual
 
-      - name: "[TODO] Dispatch release-channel image builds (DEFERRED)"
-        env:
-          GIT_TAG: ${{ steps.resolve.outputs.git_tag }}
-          IMAGE_TAG: ${{ steps.resolve.outputs.image_tag }}
-          IMAGE_TARGETS: ${{ github.event.inputs.image_targets }}
-          RELEASE_REF: ${{ steps.resolve.outputs.release_ref }}
-        run: |
-          set -euo pipefail
-          # ----------------------------------------------------------------
-          # TODO(consolidation): dispatch the per-arch RELEASE-channel image
-          # builds here once the reusable build core exists.
-          #
-          # These builds are intentionally NOT implemented in this PR. They
-          # must become thin callers of a single consolidated reusable
-          # workflow (bf-build-image.yml) — the "build consolidation"
-          # workstream queued after build validation. Writing release build
-          # steps now would be a 5th/6th copy of the build mechanics right
-          # before that consolidation, so they are deferred.
-          #
-          # When wired, this step dispatches one build per IMAGE_TARGETS entry
-          # (default: nvidia,rocm,cpu,cpu-bench), each building from
-          # RELEASE_REF and publishing the `release` channel per ADR-0004:
-          #   - immutable tag:  ${IMAGE_TAG}              (e.g. 0.20.2_bf.0.1.0)
-          #   - moving tag:     <upstream>_bf-latest      (newest BF release on the line)
-          #   - moving tag:     bf-stable                 (moved by engine after bake)
-          #   OCI labels: ai.bf-vllm.build.channel=release,
-          #               ai.bf-vllm.bf.version=<bf semver>,
-          #               ai.bf-vllm.image.tag=${IMAGE_TAG}, plus the standard
-          #               org.opencontainers.image.* / ai.vllm.* set (ADR-0004 §8b).
-          # The future callers (bf-build-{nvidia,rocm,cpu,cpu-bench}-image.yml,
-          # release channel) are dispatched via:
-          #   gh workflow run bf-build-<arch>-image.yml --ref main \
-          #     -f channel=release -f release_ref="$RELEASE_REF" \
-          #     -f git_tag="$GIT_TAG"
-          # ----------------------------------------------------------------
-          echo "::notice::Release-channel image builds for ${GIT_TAG} (targets: ${IMAGE_TARGETS}) are DEFERRED to the build-consolidation PR — no images built by this run."
 
       - name: Create and push the annotated release tag
         id: tag
@@ -540,3 +509,98 @@ jobs:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           payload-file-path: ${{ steps.slack-msg.outputs.payload_file }}
+
+  # Dispatch the per-arch release-channel image builds as an explicit matrix —
+  # one row per target, each carrying its own workflow file (and, for nvidia,
+  # the CUDA arch list). The grid is visible here rather than hidden in a bash
+  # loop, so a release run shows exactly what is triggered. The per-provider
+  # build mechanics stay in their own bf-build-<target>-image.yml (ADR: four
+  # separate per-provider files, no monolith); this job only fans out to them.
+  dispatch-builds:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One row per release image target. `name` is matched against the
+    # image_targets input so the operator can subset a release; `workflow` is
+    # the per-provider build file; `arch_list` is forwarded to nvidia only when
+    # non-empty (empty = nvidia's own default; the other providers take no arch
+    # input). Add a target by adding a row.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nvidia
+            workflow: bf-build-nvidia-image.yml
+            # Empty = use the nvidia workflow's own default (9.0 10.0 = Hopper +
+            # Blackwell). Set e.g. "8.9 9.0 10.0" here to also bake Ada/L40S into
+            # the release image.
+            arch_list: ""
+          - name: rocm
+            workflow: bf-build-rocm-image.yml
+            arch_list: ""
+          - name: cpu
+            workflow: bf-build-cpu-image.yml
+            arch_list: ""
+          - name: cpu-bench
+            workflow: bf-build-cpu-bench-image.yml
+            arch_list: ""
+    steps:
+      - name: Mint bf-vllm-sync App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: Iv23liG4vLDpTNkt8CLs
+          private-key: ${{ secrets.BF_VLLM_SYNC_PRIVATE_KEY }}
+
+      - name: Dispatch ${{ matrix.name }} release build
+        # Skip rows the operator excluded via the image_targets input. The match
+        # is on the comma-delimited list so a substring (e.g. "cpu" in
+        # "cpu-bench") cannot false-match.
+        if: ${{ contains(format(',{0},', github.event.inputs.image_targets), format(',{0},', matrix.name)) }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ matrix.workflow }}
+          ARCH_LIST: ${{ matrix.arch_list }}
+          GIT_TAG: ${{ needs.release.outputs.git_tag }}
+          RELEASE_REF: ${{ needs.release.outputs.release_ref }}
+        run: |
+          set -euo pipefail
+          # Defence-in-depth: although git_tag / release_ref are produced by the
+          # release job (version.py-validated tag, `git rev-parse main` SHA) and
+          # not free external input, reject any value that could be read as a
+          # flag before it reaches `gh`. `gh ... -f key=value` already treats the
+          # value literally, but a leading `-` is refused here so the dispatch
+          # can never be steered by a `--`-prefixed value.
+          for v in "$GIT_TAG" "$RELEASE_REF" "$ARCH_LIST"; do
+            case "$v" in
+              -*) echo "::error::refusing dispatch: value '${v}' starts with '-'." >&2; exit 1 ;;
+            esac
+          done
+
+          # Distinguish "workflow absent" from a transient gh/auth error: capture
+          # stderr instead of discarding it, so a network/permission failure is
+          # surfaced rather than wrongly reported as a missing target.
+          if ! view_err="$(gh workflow view "$WORKFLOW" --repo "$REPO" 2>&1 >/dev/null)"; then
+            if printf '%s' "$view_err" | grep -qi 'could not find\|not found\|HTTP 404'; then
+              echo "::error::release target workflow ${WORKFLOW} not found in ${REPO}." >&2
+            else
+              printf 'gh workflow view failed: %s\n' "$view_err" >&2
+              echo "::error::could not query ${WORKFLOW} (not a not-found error); see the log above." >&2
+            fi
+            exit 1
+          fi
+
+          # nvidia takes an arch_list input; the other providers do not, so the
+          # flag is only added when a non-empty arch_list is present.
+          arch_arg=()
+          if [ -n "$ARCH_LIST" ]; then
+            arch_arg=(-f "arch_list=$ARCH_LIST")
+          fi
+          # --ref main: the workflow DEFINITION runs from main; the source it
+          # builds is the release ref passed as the `ref` input. The build
+          # derives its image tag from git_tag via bf-tools/version.py.
+          gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
+            -f channel=release -f ref="$RELEASE_REF" -f git_tag="$GIT_TAG" \
+            "${arch_arg[@]}"
+          echo "::notice::Dispatched ${WORKFLOW} (channel=release ref=${RELEASE_REF} git_tag=${GIT_TAG}${ARCH_LIST:+ arch_list=${ARCH_LIST}})"
