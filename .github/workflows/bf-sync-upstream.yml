@@ -460,16 +460,20 @@ jobs:
 
       - name: Build Slack message
         id: slack-msg
-        # Guarded: the shared bot token may be unset (e.g. on a fork). When it
-        # is, this step and the notify step are skipped, so its absence never
-        # fails the run. GitHub forbids the `secrets` context in a step `if:`,
-        # so the token is surfaced via the job-level SLACK_BOT_TOKEN env and
-        # gated on it. Always runs (even when nothing changed) so the channel
-        # has a heartbeat; emits a Block Kit payload to a file consumed by the
-        # notify step. jq builds every dynamic field so paths/SHAs/markdown are
-        # safely encoded.
-        if: ${{ env.SLACK_BOT_TOKEN != '' }}
+        # always(): a FAILED sync must announce itself too — a broken sync is
+        # more important to surface than a clean one, and a silently-suppressed
+        # failure alert is exactly what we want to avoid. Gated only on the
+        # shared bot token (unset on forks); when it is, this step and the notify
+        # step skip, so its absence never fails the run. GitHub forbids the
+        # `secrets` context in a step `if:`, so the token is surfaced via the
+        # job-level SLACK_BOT_TOKEN env and gated on it. Branches on job.status;
+        # the change/conflict/clean outputs may be empty if the run failed
+        # before they were set, so the message degrades gracefully. jq builds
+        # every dynamic field so paths/SHAs/markdown are safely encoded. Same
+        # always()+outcome contract as bf-release and bf-build-notify.
+        if: ${{ always() && env.SLACK_BOT_TOKEN != '' }}
         env:
+          JOB_STATUS: ${{ job.status }}
           CHANGED: ${{ steps.upstream.outputs.changed }}
           CONFLICT: ${{ steps.merge.outputs.conflict }}
           CONFLICT_FILES: ${{ steps.merge.outputs.files }}
@@ -492,7 +496,19 @@ jobs:
           compare="${GITHUB_SERVER_URL}/vllm-project/vllm/compare/${BEFORE_SHA}...${AFTER_SHA}"
           payload_file="$RUNNER_TEMP/slack-payload.json"
 
-          if [ "$CHANGED" != "true" ]; then
+          if [ "$JOB_STATUS" != "success" ]; then
+            # A failed/cancelled run takes precedence: the change/conflict
+            # outputs above may be empty or stale, so don't trust them. Post a
+            # red failure card pointing at the run rather than a misleading
+            # success/heartbeat message.
+            header=":x: bf-vllm sync FAILED"
+            summary="The upstream sync run did not complete (status: \`$JOB_STATUS\`). \`main\` may be unchanged or left mid-sync — check the run for the failing step."
+            blocks="$(jq -n --arg h "$header" --arg s "$summary" --arg run "$RUN_URL" '
+              [ {type:"header",text:{type:"plain_text",text:$h,emoji:true}},
+                {type:"section",text:{type:"mrkdwn",text:$s}},
+                {type:"context",elements:[{type:"mrkdwn",text:("<"+$run+"|workflow run>")}]} ]')"
+
+          elif [ "$CHANGED" != "true" ]; then
             header=":repeat: bf-vllm sync — no new release tag"
             summary="upstream-main mirrored to \`$AFTER_SHORT\`, but no new release tag for \`main\` (tag-gated merge, ADR-0002). \`main\` unchanged, no PR opened."
             blocks="$(jq -n --arg h "$header" --arg s "$summary" --arg run "$RUN_URL" '
@@ -572,7 +588,7 @@ jobs:
           echo "payload_file=$payload_file" >> "$GITHUB_OUTPUT"
 
       - name: Notify Slack
-        if: ${{ env.SLACK_BOT_TOKEN != '' }}
+        if: ${{ always() && env.SLACK_BOT_TOKEN != '' }}
         uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
           method: chat.postMessage
