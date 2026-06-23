@@ -404,9 +404,9 @@ jobs:
             for t in "${targets[@]}"; do
               t="$(echo "$t" | tr -d '[:space:]')"
               case "$t" in
-                nvidia)   image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm" ;;
-                rocm)     image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm" ;;
-                cpu)      image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu" ;;
+                nvidia)   image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-openai" ;;
+                rocm)     image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-rocm" ;;
+                cpu)      image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-cpu" ;;
                 cpu-bench) image_repo="ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu-bench" ;;
                 *)        image_repo="" ;;
               esac

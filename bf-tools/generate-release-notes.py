@@ -42,9 +42,9 @@ from version import parse_git_tag
 # ``image_targets`` input selects which to include; the keys here are the
 # stable target names the workflow passes.
 IMAGE_REPOS: dict[str, str] = {
-    "nvidia": "ghcr.io/blackfuel-ai/bf-vllm/vllm",
-    "rocm": "ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm",
-    "cpu": "ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu",
+    "nvidia": "ghcr.io/blackfuel-ai/bf-vllm/vllm-openai",
+    "rocm": "ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-rocm",
+    "cpu": "ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-cpu",
     "cpu-bench": "ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu-bench",
 }
 

@@ -7,14 +7,14 @@
 #   channel=upstream  bare upstream vLLM at `ref`, no Blackfuel layer. Pushed to
 #                     the dedicated upstream repository whose PATH is the channel
 #                     signal (engine routes by repo, not label):
-#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-cpu:sha-<short>
+#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-openai-cpu:sha-<short>
 #                       …:vX.Y.Z   (upstream release tags only)
 #                       …:latest   (upstream-main only)
 #   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
 #                     Pushed to the shared repository, label-routed and never
 #                     auto-deployed:
-#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu:<base-version>-dev-<sha7>
-#                     e.g. …/vllm-cpu:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-cpu:<base-version>-dev-<sha7>
+#                     e.g. …/vllm-openai-cpu:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
 #                     embeds the clean base version (not a bare sha) because the
 #                     engine renders the image tag verbatim — a bare sha would
 #                     read as "no version" on the deployment page. The trailing
@@ -25,9 +25,9 @@
 #   channel=release   the bf-vllm tree at the release ref, tagged with the
 #                     canonical release version. Orchestrated by bf-release.yml,
 #                     which passes `git_tag`; this workflow only builds + pushes.
-#                       …/vllm-cpu:<upstream>_bf.<bf>  (immutable release)
-#                       …/vllm-cpu:<upstream>_bf-latest
-#                       …/vllm-cpu:bf-stable
+#                       …/vllm-openai-cpu:<upstream>_bf.<bf>  (immutable release)
+#                       …/vllm-openai-cpu:<upstream>_bf-latest
+#                       …/vllm-openai-cpu:bf-stable
 #
 # The CPU image is the lightest of the providers — no GPU toolchain, no CUDA/HIP
 # kernel compilation. It serves models on CPU for testing without GPUs and backs
@@ -121,11 +121,11 @@ jobs:
             upstream)
               # Dedicated upstream repository: the path is the channel signal
               # (ADR-0004 amendment), so tags stay bare and vLLM-identical.
-              image="${OWNER_IMAGE}/upstream/vllm-cpu"
+              image="${OWNER_IMAGE}/upstream/vllm-openai-cpu"
               ;;
             dev|release)
               # Shared repository, label-routed (ADR-0004).
-              image="${OWNER_IMAGE}/vllm-cpu"
+              image="${OWNER_IMAGE}/vllm-openai-cpu"
               ;;
             *)
               echo "::error::Unknown channel '${CHANNEL}'." >&2
@@ -275,6 +275,9 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.cpu
+          # Pin the OpenAI-server stage explicitly. Dockerfile.cpu's last stage
+          # is vllm-openai-zen (a derived variant); vllm-openai is the stock-
+          # equivalent stage the engine consumes (root, ENTRYPOINT vllm serve).
           target: vllm-openai
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -301,7 +304,7 @@ jobs:
           # else the dev image tag, else the upstream version, else the sha pin
           # — used to measure size and shown in the summary/Slack.
           image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && steps.prov.outputs.dev_image_tag || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.short))) }}
-          display-name: vllm-cpu
+          display-name: vllm-openai-cpu
           summary-title: CPU ${{ steps.prov.outputs.channel }} build
           runner-default: blacksmith-4vcpu
           started-epoch: ${{ steps.started.outputs.epoch }}

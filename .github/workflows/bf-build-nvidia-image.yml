@@ -11,7 +11,7 @@
 #                     bare upstream. Pushed to the dedicated upstream repository
 #                     whose PATH is the channel signal (engine routes by repo,
 #                     not label):
-#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm:sha-<short>
+#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-openai:sha-<short>
 #                       …:vX.Y.Z   (upstream release tags only)
 #                       …:latest   (upstream-main only)
 #   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
@@ -19,8 +19,8 @@
 #                     BF-layered source, so it is checked into src/ as-is with NO
 #                     overlay. Pushed to the shared repository, label-routed and
 #                     never auto-deployed:
-#                       ghcr.io/blackfuel-ai/bf-vllm/vllm:<base-version>-dev-<sha7>
-#                     e.g. …/vllm:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-openai:<base-version>-dev-<sha7>
+#                     e.g. …/vllm-openai:v0.23.1rc0_bf.0.1.0-dev-aebd933. The tag
 #                     embeds the clean base version (not a bare sha) because the
 #                     engine renders the image tag verbatim — a bare sha would
 #                     read as "no version" on the deployment page. The trailing
@@ -29,9 +29,9 @@
 #   channel=release   the bf-vllm tree at the release ref, tagged with the
 #                     canonical release version. Orchestrated by bf-release.yml,
 #                     which passes `git_tag`; this workflow only builds + pushes.
-#                       …/vllm:<upstream>_bf.<bf>  (immutable release)
-#                       …/vllm:<upstream>_bf-latest
-#                       …/vllm:bf-stable
+#                       …/vllm-openai:<upstream>_bf.<bf>  (immutable release)
+#                       …/vllm-openai:<upstream>_bf-latest
+#                       …/vllm-openai:bf-stable
 #
 # Caching (ADR-0005 amendment): sccache runs in local-disk mode, writing into
 # /sccache inside the build. That path is a BuildKit `type=cache` mount (id
@@ -154,14 +154,11 @@ jobs:
             upstream)
               # Dedicated upstream repository: the path is the channel signal
               # (ADR-0004 amendment), so tags stay bare and vLLM-identical.
-              # NVIDIA is the unsuffixed default repo (vllm), not vllm-nvidia —
-              # the engine and generate-release-notes.py both reference it as
-              # `…/vllm`; only the other arches carry an arch suffix.
-              image="${OWNER_IMAGE}/upstream/vllm"
+              image="${OWNER_IMAGE}/upstream/vllm-openai"
               ;;
             dev|release)
               # Shared repository, label-routed (ADR-0004).
-              image="${OWNER_IMAGE}/vllm"
+              image="${OWNER_IMAGE}/vllm-openai"
               ;;
             *)
               echo "::error::Unknown channel '${CHANNEL}'." >&2
@@ -329,6 +326,14 @@ jobs:
           # (upstream channel), or the bf-vllm tree (dev/release).
           context: src
           file: src/docker/Dockerfile
+          # Pin the OpenAI-server stage explicitly. docker/Dockerfile's last
+          # stage is vllm-openai-nonroot (opt-in, USER vllm, WORKDIR /home/vllm);
+          # with no target buildx would build that last stage, so the published
+          # image would run non-root with a moved CWD. The engine consumes this
+          # as stock vllm/vllm-openai: root, WORKDIR /vllm-workspace, where
+          # relative args like --chat-template examples/... resolve. vllm-openai
+          # is that stock-equivalent stage.
+          target: vllm-openai
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

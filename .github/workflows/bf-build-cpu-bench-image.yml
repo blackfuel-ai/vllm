@@ -287,6 +287,9 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.cpu-bench
+          # Pin the bench stage explicitly. This image's consumer is the
+          # performance-benchmark harness, not the OpenAI server, so it ships
+          # vllm-cpu-bench (the bench tooling stage), never vllm-openai.
           target: vllm-cpu-bench
           push: true
           tags: ${{ steps.meta.outputs.tags }}

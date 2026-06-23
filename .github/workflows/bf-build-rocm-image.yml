@@ -11,7 +11,7 @@
 #                     [bf-patch] is exercised pre-merge. Pushed to the dedicated
 #                     upstream repository whose PATH is the channel signal (engine
 #                     routes by repo, not label):
-#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-rocm:sha-<short>
+#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-openai-rocm:sha-<short>
 #                       …:vX.Y.Z   (upstream release tags only)
 #                       …:latest   (upstream-main only)
 #   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
@@ -20,7 +20,7 @@
 #                     Dockerfile.rocm builds the checked-out tree as the vLLM
 #                     source — no clone, no upstream ref resolution. Pushed to the
 #                     shared repository, label-routed and never auto-deployed:
-#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-rocm:<scm-version>-dev
+#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-rocm:<scm-version>-dev
 #                     The tag embeds the scm-describe version (not a bare sha)
 #                     because the engine renders the image tag verbatim — a bare
 #                     sha would read as "no version" on the deployment page.
@@ -28,9 +28,9 @@
 #                     dev, tagged with the canonical release version. Orchestrated
 #                     by bf-release.yml, which passes `git_tag`; this workflow
 #                     only builds + pushes.
-#                       …/vllm-rocm:<upstream>_bf.<bf>  (immutable release)
-#                       …/vllm-rocm:<upstream>_bf-latest
-#                       …/vllm-rocm:bf-stable
+#                       …/vllm-openai-rocm:<upstream>_bf.<bf>  (immutable release)
+#                       …/vllm-openai-rocm:<upstream>_bf-latest
+#                       …/vllm-openai-rocm:bf-stable
 #
 # Caching (ADR-0005): USE_SCCACHE=1 with an EMPTY SCCACHE_BUCKET_NAME falls back
 # to the on-disk sccache backend at SCCACHE_DIR=/sccache (wired in
@@ -130,7 +130,7 @@ jobs:
           case "$CHANNEL" in
             upstream)
               # Dedicated upstream repository: path is the channel signal.
-              image="${OWNER_IMAGE}/upstream/vllm-rocm"
+              image="${OWNER_IMAGE}/upstream/vllm-openai-rocm"
 
               # Resolve `ref` to a concrete vLLM commit SHA for the in-Dockerfile
               # clone (REMOTE_VLLM=1). `upstream-main` is a *bf-vllm* branch (the
@@ -178,7 +178,7 @@ jobs:
               # Shared repository, label-routed. The checked-out tree IS the vLLM
               # source (REMOTE_VLLM=0), so source_sha is the tree HEAD and there is
               # no upstream clone to resolve.
-              image="${OWNER_IMAGE}/vllm-rocm"
+              image="${OWNER_IMAGE}/vllm-openai-rocm"
               source_sha="$(git rev-parse HEAD)"
               version=""
               ;;
@@ -313,6 +313,12 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.rocm
+          # Pin the OpenAI-server stage explicitly. docker/Dockerfile.rocm's
+          # last stage is vllm-openai today (root, ENTRYPOINT vllm serve), so an
+          # unpinned build resolves to it by accident of ordering; pinning makes
+          # the published image deterministic if a later stage is ever appended.
+          # Matches stock vllm/vllm-openai, the form the engine consumes.
+          target: vllm-openai
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -337,7 +343,7 @@ jobs:
           # else the scm-describe dev version, else the upstream version, else
           # the sha pin — used to measure size and shown in the summary/Slack.
           image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && format('{0}-dev', steps.prov.outputs.scm_version) || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.source_short))) }}
-          display-name: vllm-rocm
+          display-name: vllm-openai-rocm
           summary-title: ROCm ${{ steps.prov.outputs.channel }} build
           arch-list: gfx942 gfx950
           runner-default: blacksmith-16vcpu

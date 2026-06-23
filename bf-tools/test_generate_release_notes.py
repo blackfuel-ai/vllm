@@ -135,10 +135,10 @@ def test_body_has_all_sections_and_image_strings(repo: Path) -> None:
     assert "## Images" in body
     # Pull string is `<repo>:<image_tag>` — the `:` separates repo from tag,
     # and the tag itself is the OCI (_) form from version.to_image_tag.
-    assert "ghcr.io/blackfuel-ai/bf-vllm/vllm:0.20.2_bf.0.1.0" in body
-    assert "ghcr.io/blackfuel-ai/bf-vllm/vllm-cpu:0.20.2_bf.0.1.0" in body
+    assert "ghcr.io/blackfuel-ai/bf-vllm/vllm-openai:0.20.2_bf.0.1.0" in body
+    assert "ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-cpu:0.20.2_bf.0.1.0" in body
     # Only the requested targets are rendered.
-    assert "vllm-rocm" not in body
+    assert "vllm-openai-rocm" not in body
     # The patch's upstream status surfaces in the body.
     assert "Upstream-status: candidate" in body
 

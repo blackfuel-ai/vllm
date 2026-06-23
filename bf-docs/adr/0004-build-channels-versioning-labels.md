@@ -21,11 +21,11 @@ Versioning is also a constraint: we ship downstream of an upstream version. SemV
 
 | Channel | Repository | Content | Image tag pattern | Engine routing |
 | --- | --- | --- | --- | --- |
-| `release` | `…/vllm-<arch>` | Upstream + BF patches + additive content, versioned & reviewed | `:0.20.2_bf.0.1.0`, `:0.20.2_bf-latest`, `:bf-stable` | Production pool |
-| `upstream` | `…/upstream/vllm-<arch>` | Bare upstream only, no BF layer; our Dockerfile, upstream's vLLM source | `:vX.Y.Z` (at a tag), `:<scm-version>` (between tags), `:latest` | Preview pool only — **distinguished by repository, not label** |
-| `dev` | `…/vllm-<arch>` | PR / manual / local | `:dev-pr-<N>-<sha>`, `:<base-version>-dev-<sha7>` | Never auto-deployed |
+| `release` | `…/vllm-openai-<arch>` | Upstream + BF patches + additive content, versioned & reviewed | `:0.20.2_bf.0.1.0`, `:0.20.2_bf-latest`, `:bf-stable` | Production pool |
+| `upstream` | `…/upstream/vllm-openai-<arch>` | Bare upstream only, no BF layer; our Dockerfile, upstream's vLLM source | `:vX.Y.Z` (at a tag), `:<scm-version>` (between tags), `:latest` | Preview pool only — **distinguished by repository, not label** |
+| `dev` | `…/vllm-openai-<arch>` | PR / manual / local | `:dev-pr-<N>-<sha>`, `:<base-version>-dev-<sha7>` | Never auto-deployed |
 
-The `upstream` channel lives in a **dedicated repository** (`upstream/vllm-<arch>`), so the registry path itself is the channel signal (see Amendment below). The other two channels share the main `vllm-<arch>` repository and are distinguished by the `ai.bf-vllm.build.channel` label as originally decided.
+The `upstream` channel lives in a **dedicated repository** (`upstream/vllm-openai-<arch>`), so the registry path itself is the channel signal (see Amendment below). The other two channels share the main `vllm-openai-<arch>` repository and are distinguished by the `ai.bf-vllm.build.channel` label as originally decided.
 
 **Versioning scheme**: `v<upstream-semver>+bf.<bf-semver>` — e.g., `v0.20.2+bf.0.1.0`.
 
@@ -65,15 +65,15 @@ The namespace rule is unambiguous: **a label's namespace identifies who defined 
 
 ## Amendment (2026-06-22): the upstream channel has its own registry
 
-The `upstream` channel is moved out of the shared `vllm-<arch>` repository into a dedicated `upstream/vllm-<arch>` repository, and engine routing for it is **by repository path, not by label**.
+The `upstream` channel is moved out of the shared `vllm-openai-<arch>` repository into a dedicated `upstream/vllm-openai-<arch>` repository, and engine routing for it is **by repository path, not by label**.
 
 The original design used one repository per arch and a single distinguisher — the `ai.bf-vllm.build.channel` label — to keep one source of truth. In practice the upstream channel wanted bare, vLLM-identical tags (`:v0.23.1rc0`, `:latest`) so an image is recognisable as "upstream vLLM X" at a glance and so vLLM-native tooling reads it unmodified. In a shared repository that is impossible without a disambiguating tag prefix (`upstream-…`), which re-encodes the channel a second time — the label says `channel=upstream` *and* the tag carries `upstream-`. That is two parallel encodings of the same fact: the redundancy the ADR set out to avoid, reappearing in the tag namespace.
 
-Giving the upstream channel its own repository collapses that back to a single source of truth, located at the registry: the path `…/upstream/vllm-<arch>` *is* the channel. The engine recognises an upstream image directly from where it pulled it, with no label lookup and no tag-prefix parsing, and the tags can be bare. The production pool simply never points at the `upstream/` repository, so an upstream image cannot reach production structurally — a stronger guarantee than a label the engine must remember to check, and the right risk direction for a preview-only channel.
+Giving the upstream channel its own repository collapses that back to a single source of truth, located at the registry: the path `…/upstream/vllm-openai-<arch>` *is* the channel. The engine recognises an upstream image directly from where it pulled it, with no label lookup and no tag-prefix parsing, and the tags can be bare. The production pool simply never points at the `upstream/` repository, so an upstream image cannot reach production structurally — a stronger guarantee than a label the engine must remember to check, and the right risk direction for a preview-only channel.
 
 This is a deliberate, scoped reversal of "route by label, not by location" — **for the upstream channel only**. It holds exactly one invariant in exchange: **push access to each repository is restricted to the workflow that owns it.** Location-as-trust is only sound if nothing untrusted can land at a trusted location; the `upstream/` repository accepts pushes only from the from-upstream build workflows, and the release repository only from the release workflow. With that lock in place the registry path is a trustworthy channel signal.
 
-`release` and `dev` are **not** moved — they share the `vllm-<arch>` repository and stay label-routed. Splitting all three was considered and rejected: release↔dev distinction is low-risk (both are BF-layer builds in the same trust family) and a per-PR `dev` repository multiplies registry credentials and GC policy for no safety gain. Only `upstream` — the one channel that is a different trust family (bare upstream, no review) and wants vLLM-native tags — earns its own repository.
+`release` and `dev` are **not** moved — they share the `vllm-openai-<arch>` repository and stay label-routed. Splitting all three was considered and rejected: release↔dev distinction is low-risk (both are BF-layer builds in the same trust family) and a per-PR `dev` repository multiplies registry credentials and GC policy for no safety gain. Only `upstream` — the one channel that is a different trust family (bare upstream, no review) and wants vLLM-native tags — earns its own repository.
 
 Upstream tag derivation: the version name is taken the way vLLM takes its own (`setuptools-scm`, i.e. `git describe` against upstream tags), `+` → `_` sanitised for OCI. A build exactly at an upstream tag is the clean name (`v0.23.1rc0`); a build between tags carries the scm dev-distance suffix, which honestly marks it as not-a-release. `:latest` moves only when building the canonical `upstream-main` ref.
 
@@ -86,6 +86,16 @@ The engine renders an image tag **verbatim** wherever it shows a version — the
 The base version is the bf-vllm tree's own `git describe` (`setuptools-scm` form), `+` → `_` sanitised for OCI — the same scheme the upstream channel already uses, applied to the BF tag line. It is taken **BF-first, upstream-fallback**: `git describe --match 'v*+bf.*'`, and if no BF release is reachable (a feature branch cut before the release, or a fresh upstream line with no BF release yet) it falls back to `--match 'v[0-9]*'`. The fallback always resolves on the mirror, so the derivation never fails a build. git-describe's between-tags distance suffix (`-<commits-since-tag>-g<sha>`) is stripped to keep the base clean; the commit is instead carried as a trailing `-dev-<sha7>` marker — the `-dev-` placed *before* the sha so the version reads cleanly up to the marker. Unlike git-describe, the sha carries no `g` prefix: this is our own tag format, and a bare `<sha7>` is what an operator pastes straight into `git show`. The `<sha7>` suffix keeps the tag unique per commit, so `:dev-<sha>`'s uniqueness and per-commit `cancel-in-progress` are preserved. `bf-tools/version.py` exposes `dev_image_tag()`/`parse_dev_image_tag()` so the derivation lives in one place rather than being hand-assembled in each build workflow. The per-PR `:dev-pr-<N>` form is unchanged and is added by the PR-triggered build wiring.
 
 A new descriptive label `ai.bf-vllm.scm.version` carries the same scm-describe version on every channel, so an agent reading labels (`get_image_labels`) gets the lineage even where it would otherwise have to parse the tag. It is provenance, not a routing input.
+
+## Amendment (2026-06-23): image repos follow the `vllm-openai[-<accel>]` upstream convention
+
+The three OpenAI-server image repos take vLLM's own published-image stem `vllm-openai`, suffixed by accelerator: `vllm-openai` (CUDA, the unsuffixed default), `vllm-openai-rocm`, `vllm-openai-cpu`. Earlier these were `vllm`, `vllm-rocm`, `vllm-cpu` (the `-openai` stem dropped, CUDA bare `vllm`). The bench repo stays `vllm-cpu-bench`, unchanged.
+
+vLLM publishes its server images as `vllm/vllm-openai` (CUDA), `vllm/vllm-openai-rocm`, and `vllm/vllm-openai-cpu`. Matching that stem makes the BF repos recognisable as the vLLM OpenAI-server image for each accelerator at a glance, and keeps the `-<accel>` suffix the only thing that varies — the same dimension the build workflows already key on. CUDA stays unsuffixed (`vllm-openai`) because it is upstream's default and the most-pulled image.
+
+The bench image keeps `vllm-cpu-bench` and does **not** take the `vllm-openai` stem: it is a `vllm bench` tool image (latency/throughput), not an OpenAI-compatible API server, and has no upstream `vllm-openai-*` analog — naming it `vllm-openai-cpu-bench` would falsely imply a server. It is never engine-routed, so it is exempt from the server-image convention.
+
+This renames the GHCR repository paths production and previews pull from, so consuming charts and deployments (the engine inference chart, any pinned `image:` refs) must move to the new paths in lockstep before the next release re-cut — there is no dual-publish window.
 
 ## Alternatives considered
 
