@@ -167,8 +167,13 @@ jobs:
 
           # bf_image_tag / bf_version / bf_upstream: the canonical release
           # identity, derived from git_tag via the single source of truth
-          # (bf-tools/version.py). Only consumed by the release channel;
-          # validated here so a malformed git_tag fails before the build.
+          # (bf-tools/version.py). Only consumed by the release channel. The
+          # parse runs as a single-line `python -c` (not an indented `<<'PY'`
+          # heredoc, whose preserved YAML indentation would make Python raise
+          # IndentationError) in a plain command substitution whose non-zero exit
+          # is checked explicitly — a malformed git_tag must FAIL the build, not
+          # silently yield empty tags (a `read < <(python …)` would swallow the
+          # failure as empty fields, since read ignores the substituted exit).
           bf_image_tag=""
           bf_version=""
           bf_upstream=""
@@ -177,14 +182,23 @@ jobs:
               echo "::error::channel=release requires git_tag (e.g. v0.23.1rc0+bf.0.1.0)." >&2
               exit 1
             fi
-            read -r bf_image_tag bf_version bf_upstream < <(python - "$GIT_TAG" <<'PY'
-          import sys
-          sys.path.insert(0, "bf-tools")
-          from version import parse_git_tag
-          v = parse_git_tag(sys.argv[1])
-          print(v.image_tag, v.bf, v.upstream)
-          PY
-          )
+            # The git_tag value is never interpolated into a `::error::` workflow
+            # command — a value carrying a newline + a `::` directive could
+            # otherwise smuggle an arbitrary workflow command. The offending tag
+            # is echoed to stderr as plain text instead; `::error::` stays static.
+            if ! bf_fields="$(python -c 'import sys; sys.path.insert(0, "bf-tools"); from version import parse_git_tag; v = parse_git_tag(sys.argv[1]); print(v.image_tag, v.bf, v.upstream)' "$GIT_TAG")"; then
+              printf 'git_tag failed to parse: %q\n' "$GIT_TAG" >&2
+              echo "::error::git_tag failed to parse via bf-tools/version.py (expected v<upstream>+bf.<bf>); see the value logged above." >&2
+              exit 1
+            fi
+            read -r bf_image_tag bf_version bf_upstream <<< "$bf_fields"
+            # Guard against a parse that exits 0 but yields blank fields: every
+            # release identity component must be non-empty or the build would
+            # push blank/underscore-only OCI tags.
+            if [ -z "$bf_image_tag" ] || [ -z "$bf_version" ] || [ -z "$bf_upstream" ]; then
+              echo "::error::release identity is incomplete (image_tag/bf/upstream); refusing to build with blank tags." >&2
+              exit 1
+            fi
           fi
 
           {
@@ -260,7 +274,7 @@ jobs:
             org.opencontainers.image.title=vLLM (Blackfuel, CPU bench)
             org.opencontainers.image.vendor=Blackfuel
             org.opencontainers.image.version=${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.version || steps.prov.outputs.scm_version) }}
-            ai.vllm.image.tag=${{ steps.prov.outputs.version }}
+            ai.vllm.image.tag=${{ steps.prov.outputs.version || steps.prov.outputs.bf_upstream }}
             ai.vllm.build.commit=${{ steps.prov.outputs.sha }}
             ai.bf-vllm.build.commit=${{ github.sha }}
             ai.bf-vllm.build.channel=${{ steps.prov.outputs.channel }}
