@@ -521,9 +521,9 @@ jobs:
         include:
           - name: nvidia
             workflow: bf-build-nvidia-image.yml
-            # Empty = nvidia's own default (9.0 10.0). Set "8.9 9.0 10.0" to also
-            # bake Ada/L40S into the release image.
-            arch_list: ""
+            # 8.9 (Ada/L40S) added to the production 9.0 10.0; the extra arch is
+            # a full nvcc pass (~+20 min), kept to the release path (ADR-0005).
+            arch_list: "8.9 9.0 10.0"
           - name: rocm
             workflow: bf-build-rocm-image.yml
             arch_list: ""
