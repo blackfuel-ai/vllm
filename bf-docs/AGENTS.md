@@ -177,9 +177,13 @@ Pick the most specific one. If the change spans many areas, pick the dominant on
 
 ## Code comment discipline
 
-Comments explain what the code **is** and **why** — the reasoning behind the *current* implementation — not when or why it changed. The iteration history belongs in git, not in the code.
+**The code is the source of truth; comments are the exception, not the default.** Readable code — clear names, small steps, obvious structure — carries the *what*. A comment earns its place only by adding what the code cannot say itself: a **surprising why**. Default to no comment; add one when a reader who understands the code would still be surprised, or would undo something load-bearing without the note.
 
-Keep them concise. Pick the precise word over the long phrase and say the idea once; a comment that restates the code earns nothing. Go long only when the idea genuinely needs it — a subtle invariant, a non-obvious constraint, a trap a future reader would otherwise fall into. Length should track the difficulty of the idea, nothing else.
+Comment the non-obvious *why*, never the *what*. If a comment restates what the next line plainly does, delete it. Do not narrate the design, re-explain a standard mechanism (what `fail-fast`, a matrix, an `if:` guard does), or justify a choice the reader would already accept — that is prose the code does not need. Prefer making the code clearer (a better name, an intermediate variable) over explaining unclear code with a comment.
+
+Keep each comment to the fewest words that land the idea — usually one line. A multi-paragraph comment is a smell: either the idea belongs in an ADR/`bf-docs` (link to it) or the code should be refactored so the comment isn't needed. Reserve length for the rare genuinely-subtle trap (a footgun a future reader *would* hit — e.g. a working-directory gotcha, an injection surface), and even then state it once, tersely.
+
+A file that is mostly comments is a defect, not thoroughness: it buries the code that is supposed to be read.
 
 Forbidden are change-narration comments: `# changed from X`, `# new approach`, `# previously we did Y`, `# now using Z instead`, `# fixed bug where…`, `# was …`, and the like. A reader of the code at any point in time should see only the present state described; whoever needs the "before" reaches for `git blame` and `git log`.
 

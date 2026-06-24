@@ -1,52 +1,21 @@
-# Manually-triggered ROCm image build, channel-aware (ADR-0004). One workflow
-# serves all three build channels; the `channel` input selects the registry
-# repository, tag scheme, OCI labels, and what source gets built:
+# Manually-triggered ROCm image build, channel-aware (ADR-0004). The `channel`
+# input selects the registry repo, tag scheme, OCI labels, and source. The
+# source lever is REMOTE_VLLM (docker/Dockerfile.rocm):
+#   upstream  REMOTE_VLLM=1 → the Dockerfile clones vllm-project/vllm @
+#             VLLM_BRANCH (we resolve `ref` to a concrete upstream SHA);
+#             Dockerfile.rocm comes from the calling bf-vllm ref. Dedicated
+#             repo, path = channel signal:
+#               ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-openai-rocm:sha-<short>
+#               …:vX.Y.Z (upstream release tags); …:latest (upstream-main only)
+#   dev       REMOTE_VLLM=0 → ONBUILD COPY ./ vllm/, i.e. the checked-out bf-vllm
+#             tree IS the source. Shared repo, label-routed:
+#               …/vllm-openai-rocm:<scm-version>-dev
+#   release   REMOTE_VLLM=0 like dev, at the release ref via bf-release's git_tag:
+#               …/vllm-openai-rocm:<upstream>_bf.<bf> + :<upstream>_bf-latest + :bf-stable
 #
-#   channel=upstream  bare upstream vLLM at `ref`. docker/Dockerfile.rocm clones
-#                     the vLLM source inside the build (REMOTE_VLLM=1, fetch_vllm_1
-#                     -> git clone vllm-project/vllm @ VLLM_BRANCH), so we resolve
-#                     `ref` to a concrete upstream commit SHA and pass it as
-#                     VLLM_BRANCH. The build context (Dockerfile.rocm itself)
-#                     comes from the calling bf-vllm ref so a Dockerfile.rocm
-#                     [bf-patch] is exercised pre-merge. Pushed to the dedicated
-#                     upstream repository whose PATH is the channel signal (engine
-#                     routes by repo, not label):
-#                       ghcr.io/blackfuel-ai/bf-vllm/upstream/vllm-openai-rocm:sha-<short>
-#                       …:vX.Y.Z   (upstream release tags only)
-#                       …:latest   (upstream-main only)
-#   channel=dev       the bf-vllm tree at `ref` (already upstream + BF layer).
-#                     We check the tree out as the build context and build with
-#                     REMOTE_VLLM=0 (fetch_vllm_0 -> ONBUILD COPY ./ vllm/), so
-#                     Dockerfile.rocm builds the checked-out tree as the vLLM
-#                     source — no clone, no upstream ref resolution. Pushed to the
-#                     shared repository, label-routed and never auto-deployed:
-#                       ghcr.io/blackfuel-ai/bf-vllm/vllm-openai-rocm:<scm-version>-dev
-#                     The tag embeds the scm-describe version (not a bare sha)
-#                     because the engine renders the image tag verbatim — a bare
-#                     sha would read as "no version" on the deployment page.
-#   channel=release   the bf-vllm tree at the release ref, REMOTE_VLLM=0 like
-#                     dev, tagged with the canonical release version. Orchestrated
-#                     by bf-release.yml, which passes `git_tag`; this workflow
-#                     only builds + pushes.
-#                       …/vllm-openai-rocm:<upstream>_bf.<bf>  (immutable release)
-#                       …/vllm-openai-rocm:<upstream>_bf-latest
-#                       …/vllm-openai-rocm:bf-stable
-#
-# Caching (ADR-0005): USE_SCCACHE=1 with an EMPTY SCCACHE_BUCKET_NAME falls back
-# to the on-disk sccache backend at SCCACHE_DIR=/sccache (wired in
-# docker/Dockerfile.rocm). The compiler cache lives in a BuildKit `type=cache`
-# mount that the Blacksmith Docker builder persists across runs on local disk —
-# no S3, no IAM, no cross-region round-trip on every hipcc miss. There is
-# intentionally NO `useblacksmith/stickydisk` action and NO SCCACHE_DIR /
-# SCCACHE_CACHE_SIZE build-arg: the builder's automatic cache-mount persistence
-# is the persistence layer.
-#
-# Trigger: manual only (workflow_dispatch). ROCm builds are heavy; this is not
-# wired to PR/push to avoid burning the runner pool on every change.
-#
-# Convention: `bf-` filename prefix per ADR-0003 (BF owns this workflow file).
-# Third-party actions are SHA-pinned with their tag in a comment per the
-# supply-chain hygiene rule in CLAUDE.md.
+# Caching (ADR-0005): USE_SCCACHE=1 + empty SCCACHE_BUCKET_NAME = on-disk sccache
+# at /sccache, a BuildKit cache mount the Blacksmith builder persists (no S3, no
+# stickydisk action). Manual-only: ROCm builds are heavy.
 
 name: bf-build-rocm-image
 
@@ -83,33 +52,22 @@ permissions:
   packages: write
 
 env:
-  # Pinned by digest for reproducibility. Resolved from the current upstream
-  # default tag `rocm/vllm-dev:base` (linux/amd64, ROCm at /opt/rocm,
-  # PYTORCH_ROCM_ARCH includes gfx942/gfx950 = MI300/MI325), created 2026-06-10.
-  # Verified to pull (HTTP 200, ~9.9 GB). Refresh by re-resolving the tag's
-  # digest.
+  # rocm/vllm-dev:base pinned by digest (gfx942/gfx950 = MI300/MI325). Refresh
+  # by re-resolving the tag's digest.
   BASE_IMAGE: rocm/vllm-dev@sha256:251f19b4a8ac67b575e48dda34c5b0c5a0f400c55d919601c9c08eab9fd2868a
 
 jobs:
   build-rocm:
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    # ROCm/HIP compile surface is large; a cold build is long. Cap well under
-    # GitHub's 360 min hard kill while leaving room for a cold run.
     timeout-minutes: 300
     steps:
       - name: Record build start time
         id: started
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
 
-      # Checkout the build context:
-      #   upstream — the calling bf-vllm ref (github.ref, default: the branch this
-      #     was dispatched on). Dockerfile.rocm comes from here so a [bf-patch] is
-      #     exercised pre-merge; the vLLM source is cloned inside the build from
-      #     the resolved upstream SHA (REMOTE_VLLM=1), not this checkout.
-      #   dev/release — the bf-vllm tree at `ref`. The tree IS the vLLM source
-      #     (REMOTE_VLLM=0 -> ONBUILD COPY ./ vllm/) and carries Dockerfile.rocm,
-      #     so one checkout serves both. fetch-depth: 0 + tags so the dev channel
-      #     can `git describe` the tree to derive a human-readable version.
+      # upstream checks out the calling ref (Dockerfile.rocm source; vLLM is
+      # cloned in-build); dev/release check out `ref` itself (the tree that gets
+      # COPYed as the source). fetch-depth: 0 for `git describe`.
       - name: Checkout bf-vllm
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
@@ -129,45 +87,39 @@ jobs:
 
           case "$CHANNEL" in
             upstream)
-              # Dedicated upstream repository: path is the channel signal.
               image="${OWNER_IMAGE}/upstream/vllm-openai-rocm"
 
-              # Resolve `ref` to a concrete vLLM commit SHA for the in-Dockerfile
-              # clone (REMOTE_VLLM=1). `upstream-main` is a *bf-vllm* branch (the
-              # mirror of vllm-project/vllm:main, ADR-0002) that does NOT exist on
-              # vLLM's repo, so resolve it to the mirror's HEAD SHA — a real vLLM
-              # commit, fetchable by full SHA (allowAnySHA1InWant). Any other ref
-              # (a vLLM tag/branch/sha) passes through unchanged. The resolved SHA
-              # is what we both build (VLLM_BRANCH) and label with, so :sha-<short>
-              # identifies the actual upstream vLLM source.
+              # Resolve `ref` to a concrete vLLM SHA for the in-Dockerfile clone.
+              # upstream-main is a bf-vllm-only branch, so map it to the mirror
+              # HEAD (a real vLLM commit, fetchable by SHA); other refs pass
+              # through. source_sha is what we build (VLLM_BRANCH) and label.
               if [ "$REF" = "upstream-main" ]; then
                 git fetch --depth 1 origin upstream-main
                 source_sha="$(git rev-parse FETCH_HEAD)"
               else
                 source_sha="$REF"
               fi
-              # Fail fast (seconds) rather than deep in the multi-hour build: prove
-              # the resolved ref is fetchable from vLLM before the build starts.
-              #   - full 40-hex SHA: not necessarily a ref tip, so ls-remote can't
-              #     see it; do a real shallow `git fetch <repo> <sha>`. A bogus SHA
-              #     fails here.
-              #   - anything else (tag/branch): must resolve via `git ls-remote`.
+              # Prove it's fetchable from vLLM before the multi-hour build: a SHA
+              # via `git fetch <sha>` (ls-remote can't see non-tip commits), a
+              # tag/branch via ls-remote.
+              # ref/source_sha are logged via %q (not interpolated into the
+              # `::error::` directive, which a newline + `::` could hijack).
               if printf '%s' "$source_sha" | grep -Eqx '[0-9a-f]{40}'; then
                 if git fetch --depth 1 "$vllm_repo" "$source_sha" >/dev/null 2>&1; then
-                  echo "source_sha '$source_sha' is fetchable from $vllm_repo."
+                  echo "source_sha is fetchable from $vllm_repo."
                 else
-                  echo "::error::ref '$REF' looks like a SHA but is not fetchable from $vllm_repo. Pass a real vLLM commit, a tag/branch, or 'upstream-main'." >&2
+                  printf 'unfetchable ref / source_sha: %q / %q\n' "$REF" "$source_sha" >&2
+                  echo "::error::ref looks like a SHA but is not fetchable from vLLM; pass a real vLLM commit, a tag/branch, or 'upstream-main'." >&2
                   exit 1
                 fi
               elif git ls-remote --exit-code "$vllm_repo" "$source_sha" >/dev/null 2>&1; then
-                echo "source_sha '$source_sha' resolves on $vllm_repo."
+                echo "source_sha resolves on $vllm_repo."
               else
-                echo "::error::ref '$REF' (resolved '$source_sha') does not resolve as a tag/branch on $vllm_repo. Pass a valid vLLM ref or 'upstream-main'." >&2
+                printf 'unresolved ref / source_sha: %q / %q\n' "$REF" "$source_sha" >&2
+                echo "::error::ref does not resolve as a tag/branch on vLLM; pass a valid vLLM ref or 'upstream-main'." >&2
                 exit 1
               fi
-              # version: the bare vLLM-identical name, set only when the built ref
-              # is an upstream release tag (vX.Y.Z[rcN]); a between-tags build
-              # leaves it empty (sha pin + :latest only).
+              # version: set only when the ref is an upstream release tag.
               if printf '%s' "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$'; then
                 version="$REF"
               else
@@ -188,25 +140,16 @@ jobs:
               ;;
           esac
 
-          # scm_version: the bf-vllm tree's self-description (git describe /
-          # setuptools-scm). Prefer the BF release line (v<upstream>+bf.<bf>);
-          # fall back to the upstream tag line when no BF release is reachable.
-          # `+` -> `_` for OCI. For the upstream channel the checkout is the
-          # calling ref, so this describes the Dockerfile's bf-vllm ref (a
-          # descriptive provenance label only there). Never fails: the upstream
-          # fallback always resolves on this mirror.
+          # scm_version: the tree's git-describe self-name (BF release line, else
+          # upstream tag line), `+`->`_` for OCI. The fallback always resolves.
           scm_raw="$(git describe --tags --match 'v*+bf.*' HEAD 2>/dev/null \
                   || git describe --tags --match 'v[0-9]*' HEAD)"
           scm_version="${scm_raw//+/_}"
 
-          # bf_image_tag / bf_version / bf_upstream: the canonical release
-          # identity, derived from git_tag via bf-tools/version.py. Only consumed
-          # by the release channel. The parse runs as a single-line `python -c`
-          # (not an indented `<<'PY'` heredoc, whose preserved YAML indentation
-          # would make Python raise IndentationError) in a plain command
-          # substitution whose non-zero exit is checked explicitly — a malformed
-          # git_tag must FAIL the build, not silently yield empty tags (a
-          # `read < <(python …)` would swallow the failure as empty fields).
+          # Release identity from git_tag via version.py. Single-line `python -c`
+          # (an indented `<<'PY'` heredoc would raise IndentationError); explicit
+          # exit check so a bad git_tag fails loudly instead of yielding empty
+          # tags (a `read < <(python …)` swallows the substituted exit).
           bf_image_tag=""
           bf_version=""
           bf_upstream=""
@@ -215,11 +158,18 @@ jobs:
               echo "::error::channel=release requires git_tag (e.g. v0.23.1rc0+bf.0.1.0)." >&2
               exit 1
             fi
+            # git_tag is never interpolated into `::error::` (a newline + `::`
+            # could smuggle a workflow command); logged via %q instead.
             if ! bf_fields="$(python -c 'import sys; sys.path.insert(0, "bf-tools"); from version import parse_git_tag; v = parse_git_tag(sys.argv[1]); print(v.image_tag, v.bf, v.upstream)' "$GIT_TAG")"; then
-              echo "::error::git_tag '${GIT_TAG}' failed to parse via bf-tools/version.py (expected v<upstream>+bf.<bf>)." >&2
+              printf 'git_tag failed to parse: %q\n' "$GIT_TAG" >&2
+              echo "::error::git_tag failed to parse via bf-tools/version.py (expected v<upstream>+bf.<bf>); see the value logged above." >&2
               exit 1
             fi
             read -r bf_image_tag bf_version bf_upstream <<< "$bf_fields"
+            if [ -z "$bf_image_tag" ] || [ -z "$bf_version" ] || [ -z "$bf_upstream" ]; then
+              echo "::error::release identity is incomplete (image_tag/bf/upstream); refusing to build with blank tags." >&2
+              exit 1
+            fi
           fi
 
           {
@@ -234,10 +184,8 @@ jobs:
             echo "bf_upstream=${bf_upstream}"
           } >> "$GITHUB_OUTPUT"
 
-      # The build context checked out above is the bf-vllm tree; the bf-build-
-      # notify composite is present, but for parity with the other three builds
-      # (whose context may be bare upstream) we resolve it from a dedicated
-      # sparse checkout so `uses: ./bf-actions/...` resolves on every channel.
+      # Sparse-checkout the composite action into bf-actions/ for parity with
+      # the other builds (whose context isn't the bf-vllm root).
       - name: Checkout BF composite actions from the calling ref
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
@@ -261,15 +209,9 @@ jobs:
         uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
         with:
           images: ${{ steps.prov.outputs.image }}
-          # Tag scheme per channel (ADR-0004):
-          #   upstream — bare, vLLM-identical in the dedicated upstream repo:
-          #     :sha-<short> (the upstream source SHA) always; :vX.Y.Z on an
-          #     upstream release tag; :latest only for upstream-main.
-          #   dev — the scm-describe version + a -dev marker; the version (not a
-          #     bare sha) is what the engine shows verbatim, the g<sha> keeps it
-          #     unique per commit.
-          #   release — the immutable release version + the two moving aliases
-          #     (<upstream>_bf-latest, bf-stable) for engine pinning/promotion.
+          # Tags per channel (ADR-0004): upstream → :sha-<short> / :vX.Y.Z /
+          # :latest (upstream-main); dev → :<scm-version>-dev; release →
+          # immutable :<bf-image-tag> + moving :<upstream>_bf-latest / :bf-stable.
           tags: |
             type=raw,value=sha-${{ steps.prov.outputs.source_short }},enable=${{ steps.prov.outputs.channel == 'upstream' }}
             type=raw,value=${{ steps.prov.outputs.version }},enable=${{ steps.prov.outputs.channel == 'upstream' && steps.prov.outputs.version != '' }}
@@ -278,17 +220,9 @@ jobs:
             type=raw,value=${{ steps.prov.outputs.bf_image_tag }},enable=${{ steps.prov.outputs.channel == 'release' }}
             type=raw,value=${{ steps.prov.outputs.bf_upstream }}_bf-latest,enable=${{ steps.prov.outputs.channel == 'release' }}
             type=raw,value=bf-stable,enable=${{ steps.prov.outputs.channel == 'release' }}
-          # image.revision / ai.bf-vllm.build.commit = the bf-vllm workflow commit
-          # (github.sha); ai.vllm.build.commit = the vLLM source commit actually
-          # built (upstream vLLM for upstream; the bf-vllm tree HEAD for
-          # dev/release). ai.bf-vllm.build.channel is descriptive on upstream
-          # (routing by repo path) and the routing input on dev/release.
-          # ai.bf-vllm.bf.version is set on release only; ai.bf-vllm.scm.version
-          # records the tree's describe-version for agents (get_image_labels).
-          # ai.vllm.image.tag holds the UPSTREAM tag (ADR-0004): the upstream
-          # release name on the upstream channel, the upstream portion of the
-          # release version (bf_upstream) on the release channel, empty for a
-          # dev tree build that sits between upstream tags.
+          # ai.vllm.* keep upstream semantics (build.commit = the vLLM source
+          # built); ai.bf-vllm.* hold BF provenance. image.tag = the upstream
+          # tag (ADR-0004), bf.version on release only.
           labels: |
             org.opencontainers.image.source=https://github.com/blackfuel-ai/bf-vllm
             org.opencontainers.image.revision=${{ github.sha }}
@@ -303,10 +237,8 @@ jobs:
             ai.bf-vllm.bf.version=${{ steps.prov.outputs.bf_version }}
             ai.bf-vllm.scm.version=${{ steps.prov.outputs.scm_version }}
 
-      # Cache-aware builder. USE_SCCACHE=1 + empty SCCACHE_BUCKET_NAME =
-      # local-disk sccache backend (see header). REMOTE_VLLM selects the source:
-      # 1 = clone vllm-project/vllm @ VLLM_BRANCH (upstream channel); 0 = ONBUILD
-      # COPY ./ vllm/ (dev/release — the checked-out bf-vllm tree is the source).
+      # REMOTE_VLLM selects the source: 1 = clone vLLM @ VLLM_BRANCH (upstream);
+      # 0 = COPY the checked-out tree (dev/release). sccache per the header.
       - name: Build and push ROCm image
         id: build
         uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2
@@ -339,9 +271,6 @@ jobs:
         uses: ./bf-actions/.github/actions/bf-build-notify
         with:
           image: ${{ steps.prov.outputs.image }}
-          # The tag identifying this image best, by channel: the release version,
-          # else the scm-describe dev version, else the upstream version, else
-          # the sha pin — used to measure size and shown in the summary/Slack.
           image-tag: ${{ steps.prov.outputs.channel == 'release' && steps.prov.outputs.bf_image_tag || (steps.prov.outputs.channel == 'dev' && format('{0}-dev', steps.prov.outputs.scm_version) || (steps.prov.outputs.version || format('sha-{0}', steps.prov.outputs.source_short))) }}
           display-name: vllm-openai-rocm
           summary-title: ROCm ${{ steps.prov.outputs.channel }} build

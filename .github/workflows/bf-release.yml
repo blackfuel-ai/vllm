@@ -1,19 +1,9 @@
 # bf-vllm release orchestration (manual, workflow_dispatch only).
 #
-# Cuts a Blackfuel release per ADR-0004: a single canonical version
-#   v<upstream-semver>+bf.<bf-semver>   (e.g. v0.20.2+bf.0.1.0)
-# tagged on `main`, with a matching GitHub release and (in a later PR) the
-# `release`-channel arch images on GHCR.
-#
-# Release model (ADR-0002 §Decision): we tag `main` DIRECTLY. Release
-# branches are OPTIONAL — created only for hotfix isolation of an old
-# upstream line (`release/v<upstream>+bf.<bf>.x`), NOT on the normal release
-# path. `main` is never force-pushed, so tags on it are stable forever; there
-# is no rebase, no `bf/patches` branch, no upstream-tag + BF-layer re-merge.
-# (The master plan §8c was written in an earlier rebase-era design and
-# describes building a release branch by merging the BF layer onto the
-# upstream tag; ADR-0002's merge model supersedes that — `main` already IS
-# upstream-merged + the BF layer, so we tag the chosen point on `main`.)
+# Cuts a Blackfuel release per ADR-0004: the canonical version
+# v<upstream-semver>+bf.<bf-semver> tagged DIRECTLY on `main` (ADR-0002 — no
+# rebase, no bf/patches branch; main already is upstream-merged + the BF layer),
+# with a matching GitHub release and the release-channel arch images on GHCR.
 #
 # What this workflow does:
 #   1. Validate inputs — bf_version shape via bf-tools/version.py; resolve
@@ -516,30 +506,23 @@ jobs:
           # it instead so a misconfigured channel/token is visible, not silent.
           errors: true
 
-  # Dispatch the per-arch release-channel image builds as an explicit matrix —
-  # one row per target, each carrying its own workflow file (and, for nvidia,
-  # the CUDA arch list). The grid is visible here rather than hidden in a bash
-  # loop, so a release run shows exactly what is triggered. The per-provider
-  # build mechanics stay in their own bf-build-<target>-image.yml (ADR: four
-  # separate per-provider files, no monolith); this job only fans out to them.
+  # Fan out the release-channel builds as an explicit matrix — one row per
+  # target, each carrying its own build workflow (the per-provider mechanics
+  # stay in those files; this job only dispatches). `name` is matched against
+  # image_targets so a release can be subset; `arch_list` is forwarded to nvidia
+  # only when non-empty. Add a target by adding a row.
   dispatch-builds:
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # One row per release image target. `name` is matched against the
-    # image_targets input so the operator can subset a release; `workflow` is
-    # the per-provider build file; `arch_list` is forwarded to nvidia only when
-    # non-empty (empty = nvidia's own default; the other providers take no arch
-    # input). Add a target by adding a row.
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: nvidia
             workflow: bf-build-nvidia-image.yml
-            # Empty = use the nvidia workflow's own default (9.0 10.0 = Hopper +
-            # Blackwell). Set e.g. "8.9 9.0 10.0" here to also bake Ada/L40S into
-            # the release image.
+            # Empty = nvidia's own default (9.0 10.0). Set "8.9 9.0 10.0" to also
+            # bake Ada/L40S into the release image.
             arch_list: ""
           - name: rocm
             workflow: bf-build-rocm-image.yml
@@ -559,9 +542,7 @@ jobs:
           private-key: ${{ secrets.BF_VLLM_SYNC_PRIVATE_KEY }}
 
       - name: Dispatch ${{ matrix.name }} release build
-        # Skip rows the operator excluded via the image_targets input. The match
-        # is on the comma-delimited list so a substring (e.g. "cpu" in
-        # "cpu-bench") cannot false-match.
+        # Comma-delimited match so "cpu" doesn't select "cpu-bench".
         if: ${{ contains(format(',{0},', github.event.inputs.image_targets), format(',{0},', matrix.name)) }}
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -572,21 +553,15 @@ jobs:
           RELEASE_REF: ${{ needs.release.outputs.release_ref }}
         run: |
           set -euo pipefail
-          # Defence-in-depth: although git_tag / release_ref are produced by the
-          # release job (version.py-validated tag, `git rev-parse main` SHA) and
-          # not free external input, reject any value that could be read as a
-          # flag before it reaches `gh`. `gh ... -f key=value` already treats the
-          # value literally, but a leading `-` is refused here so the dispatch
-          # can never be steered by a `--`-prefixed value.
+          # Reject a `-`-prefixed value so it can't be read as a `gh` flag.
           for v in "$GIT_TAG" "$RELEASE_REF" "$ARCH_LIST"; do
             case "$v" in
               -*) echo "::error::refusing dispatch: value '${v}' starts with '-'." >&2; exit 1 ;;
             esac
           done
 
-          # Distinguish "workflow absent" from a transient gh/auth error: capture
-          # stderr instead of discarding it, so a network/permission failure is
-          # surfaced rather than wrongly reported as a missing target.
+          # Keep gh's stderr so a transient/auth failure isn't reported as a
+          # missing workflow.
           if ! view_err="$(gh workflow view "$WORKFLOW" --repo "$REPO" 2>&1 >/dev/null)"; then
             if printf '%s' "$view_err" | grep -qi 'could not find\|not found\|HTTP 404'; then
               echo "::error::release target workflow ${WORKFLOW} not found in ${REPO}." >&2
@@ -597,15 +572,12 @@ jobs:
             exit 1
           fi
 
-          # nvidia takes an arch_list input; the other providers do not, so the
-          # flag is only added when a non-empty arch_list is present.
           arch_arg=()
           if [ -n "$ARCH_LIST" ]; then
             arch_arg=(-f "arch_list=$ARCH_LIST")
           fi
-          # --ref main: the workflow DEFINITION runs from main; the source it
-          # builds is the release ref passed as the `ref` input. The build
-          # derives its image tag from git_tag via bf-tools/version.py.
+          # --ref main: run the workflow definition from main; build the release
+          # ref passed as `ref`.
           gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
             -f channel=release -f ref="$RELEASE_REF" -f git_tag="$GIT_TAG" \
             "${arch_arg[@]}"
