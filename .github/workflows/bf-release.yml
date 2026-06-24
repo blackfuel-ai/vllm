@@ -13,9 +13,9 @@
 #   2. Resolve the release ref on `main` (default: current main HEAD).
 #   3. Run the curated CI (the bf-precommit suite) on the release ref.
 #   4. Dispatch the per-arch `release`-channel image builds — an explicit
-#      matrix (the dispatch-builds job) with one row per target
-#      (nvidia/rocm/cpu/cpu-bench), each carrying its own build workflow and,
-#      for nvidia, the CUDA arch list. image_targets subsets which rows fire.
+#      matrix (dispatch-builds), one row per target, and watch each to
+#      completion so a build killed mid-run (which skips its own notify) still
+#      fails this run and fires the notify-failed-builds Slack alert.
 #   5. Create the annotated git tag v<upstream>+bf.<bf> (via version.py) and
 #      push it with the bf-vllm-sync App token.
 #   6. Generate the release notes (bf-tools/generate-release-notes.py) and
@@ -514,7 +514,11 @@ jobs:
   dispatch-builds:
     needs: release
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Each row dispatches its build AND watches it to completion, so this job's
+    # outcome reflects the build's real result (see the dispatch step). The cap
+    # must therefore cover the longest cold build (nvidia/rocm ~hours), not just
+    # the dispatch — GitHub's 360 min job max, matching the build workflows.
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -577,8 +581,82 @@ jobs:
             arch_arg=(-f "arch_list=$ARCH_LIST")
           fi
           # --ref main: run the workflow definition from main; build the release
-          # ref passed as `ref`.
+          # ref passed as `ref`. Record the dispatch time so we can find the run
+          # this call created (gh workflow run does not return its id).
+          before="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
             -f channel=release -f ref="$RELEASE_REF" -f git_tag="$GIT_TAG" \
             "${arch_arg[@]}"
-          echo "::notice::Dispatched ${WORKFLOW} (channel=release ref=${RELEASE_REF} git_tag=${GIT_TAG}${ARCH_LIST:+ arch_list=${ARCH_LIST}})"
+
+          # Resolve the run id this dispatch created (newest run of WORKFLOW at/
+          # after `before`); it takes a moment to appear, so retry.
+          run_id=""
+          for _ in $(seq 1 20); do
+            run_id="$(gh run list --repo "$REPO" --workflow "$WORKFLOW" \
+              --created ">=$before" --limit 1 --json databaseId \
+              --jq '.[0].databaseId // empty')"
+            [ -n "$run_id" ] && break
+            sleep 6
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::dispatched ${WORKFLOW} but could not resolve its run id to track it." >&2
+            exit 1
+          fi
+          run_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${run_id}"
+          echo "::notice::Dispatched ${WORKFLOW} → ${run_url}"
+
+          # Watch the build to completion so THIS job's outcome reflects the
+          # build's real result. A build runner killed mid-build (so its own
+          # always() notify step never runs — the bf-0.3.0 rocm case) still
+          # surfaces here as a non-zero exit, failing this job and triggering the
+          # notify-failed-builds job below. This job is on a stable ubuntu
+          # runner, so it is not subject to the same kill.
+          echo "Watching ${WORKFLOW} run ${run_id} to completion…"
+          if ! gh run watch "$run_id" --repo "$REPO" --exit-status >/dev/null 2>&1; then
+            concl="$(gh run view "$run_id" --repo "$REPO" --json conclusion --jq '.conclusion // "unknown"')"
+            echo "::error::release build ${WORKFLOW} (run ${run_id}) ended ${concl}: ${run_url}" >&2
+            exit 1
+          fi
+          echo "::notice::release build ${WORKFLOW} (run ${run_id}) succeeded."
+
+  # Alert when any release-channel build failed (or was killed mid-build). The
+  # build workflows post their own per-build Slack card, but a runner killed
+  # mid-build never reaches that always() step — so a failed release image can
+  # be completely silent (the bf-0.3.0 rocm case). This job runs on a stable
+  # ubuntu runner if dispatch-builds reports failure, so the alert always fires.
+  notify-failed-builds:
+    needs: [release, dispatch-builds]
+    # `env` is not allowed in a job `if:` (only github/inputs/needs/vars), so the
+    # token is gated on the steps instead. Fire when dispatch-builds failed or
+    # was cancelled (a killed runner surfaces as either) — not on `skipped`,
+    # which only happens when the upstream release job itself failed (already
+    # reported on its own path).
+    if: ${{ always() && (needs.dispatch-builds.result == 'failure' || needs.dispatch-builds.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Render Slack payload
+        id: payload
+        if: ${{ env.SLACK_BOT_TOKEN != '' }}
+        env:
+          CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
+          GIT_TAG: ${{ needs.release.outputs.git_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          text=":rotating_light: release ${GIT_TAG}: one or more release-channel image builds FAILED or were killed. Check the dispatch-builds job for which target and its run link."
+          jq -n --arg channel "$CHANNEL" --arg text "$text" --arg run_url "$RUN_URL" \
+            '{ channel: $channel, text: $text,
+               blocks: [
+                 { type: "section", text: { type: "mrkdwn", text: $text } },
+                 { type: "context", elements: [ { type: "mrkdwn", text: ("<" + $run_url + "|release run>") } ] }
+               ] }' > "$RUNNER_TEMP/slack-fail.json"
+          echo "path=$RUNNER_TEMP/slack-fail.json" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack (failed release builds)
+        if: ${{ env.SLACK_BOT_TOKEN != '' }}
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload-file-path: ${{ steps.payload.outputs.path }}
