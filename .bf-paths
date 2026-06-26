@@ -70,3 +70,11 @@ Makefile
 # they live in otherwise upstream-owned directories.
 docker/Dockerfile.cpu-bench
 requirements/cpu-bench.txt
+
+# Blackfuel-owned feature/unit test layer. Upstream owns the rest of tests/,
+# but this single BF root is never created by upstream, so it never conflicts
+# on sync and carries no [bf-patch] 14-day decay clock — same reasoning as the
+# cpu-bench files above (a BF path inside an otherwise upstream-owned dir). BF
+# features ship their tests here; the CPU-safe ones run in Tier-0 via
+# bf-cpu-smoke (ADR-0003 classification, ADR-0007 test tiers).
+tests/bf/

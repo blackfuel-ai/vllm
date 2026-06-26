@@ -51,6 +51,14 @@ Every `[bf-patch]` commit carries:
 - `Upstream-status:` trailer — one of `candidate | submitted-#NNNN | pending-upstream-#NNNN | rejected | bf-only`.
 - 14-day deadline to move from `candidate` to `submitted-#NNNN` (or be reclassified to `bf-only` / `rejected`).
 
+## Test discipline
+
+Write the test first; run it, then fix the *code* — never edit a test to fit the code. If a test and the code genuinely disagree about intended behaviour, stop and ask the operator; do not resolve it yourself. Every BF feature (a `[bf-feature]`, or a `[bf-patch]` that adds behaviour) **must** ship its test in the **same PR**.
+
+BF tests live in **`tests/bf/`** — a single Blackfuel-authored root. The rest of `tests/` is upstream-owned: a test dropped next to upstream files conflicts on every sync merge and (being inside an upstream path) gets mislabelled as a `[bf-patch]` carrying a 14-day upstreaming clock. `tests/bf/` sidesteps both — it's a bf-additive path in `.bf-paths` ([ADR-0003](./adr/0003-change-classification-and-patch-discipline.md)), so a sync never touches it and no decay clock applies. Default here; only put a `bf_*` test beside an upstream file when it genuinely must import an upstream test fixture (rare).
+
+CPU-safe BF tests (no GPU, no model download) run on **every PR** as part of Tier-0 via `bf-cpu-smoke.yml`, which collects the whole `tests/bf/` tree — the same `python -m pytest … tests/bf/` invocation a developer runs locally ([ADR-0007](./adr/0007-functional-test-strategy.md) Tier-0). A BF test that needs a GPU or a model download still lives in `tests/bf/` but **must** guard itself (the `requires_gpu` / `requires_model_download` markers in `tests/bf/conftest.py`) so the offline Tier-0 run skips it cleanly; it executes later under Tier-1. `tests/bf/test_error_codes.py` (the structured OpenAI error-code surface) is the worked reference.
+
 ## Local setup
 
 After cloning the repo for the first time:

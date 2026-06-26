@@ -20,10 +20,12 @@
 #   4. Runs a curated, CPU-safe slice of the inherited upstream `tests/` tree:
 #      pure-Python / import-level tests of core plumbing, PLUS a compiled-CPU
 #      functional test (the top-k/top-p sampler) drawn from upstream's own CPU
-#      hardware-CI list. Neither needs a GPU or a model
-#      download. This is the payoff for the sync workflow (ADR-0002): upstream
-#      drift that breaks our [bf-patch]es or `bf/files` goes red on the [sync]
-#      PR BEFORE merge instead of surfacing in production.
+#      hardware-CI list, PLUS the whole BF feature-test tree `tests/bf/` (the
+#      BF unit/feature layer; ADR-0007 Tier-0, ADR-0003 bf-additive). None
+#      needs a GPU or a model download. This is the payoff for the sync
+#      workflow (ADR-0002): upstream drift that breaks our [bf-patch]es or
+#      `bf/files` goes red on the [sync] PR BEFORE merge instead of surfacing
+#      in production.
 #
 # Why this gates [sync] PRs too (deliberately NOT exempt, unlike
 # bf-patches-trailer-lint): a sync's entire reason for existing as a risk is
@@ -282,6 +284,15 @@ jobs:
           #     launch. They guard the context_length_exceeded code and the
           #     ErrorResponse/.error.status_code contract.
           #
+          # (f) tests/bf/: the BF feature/unit test layer (bf-additive root,
+          #     ADR-0003). Every BF feature ships its CPU-safe test here and it
+          #     runs on every PR via this gate (ADR-0007 Tier-0). The whole dir
+          #     is collected; BF tests needing a GPU or a model download guard
+          #     themselves via tests/bf/conftest.py so this offline run skips
+          #     them. Listed as a directory, not files: unlike the curated
+          #     upstream slice (which we hand-pin against upstream renames),
+          #     this tree is ours, so new BF tests join Tier-0 automatically.
+          #
           # NOTE (ADR-0007 curated-set drift): the upstream sync that landed on
           # main moved/removed two files this list used to point at
           # (test_minimax_m3_reasoning_parser.py and test_structural_tag_registry.py);
@@ -335,6 +346,7 @@ jobs:
             tests/entrypoints/openai/responses/test_errors.py
             tests/entrypoints/openai/completion/test_lora_resolvers.py
             tests/renderers/test_completions.py
+            tests/bf/
           # Per-test deselects (kept narrow — deselect the one broken case, not
           # the whole file, so the rest of the file's coverage stays):
           #   test_precompiled_install_flags_are_orthogonal asserts that setting
@@ -375,6 +387,7 @@ jobs:
             echo "- compiled CPU: \`v1/sample/test_topk_topp_sampler\` (sampler)"
             echo "- parsers (offline, mock tokenizers): reasoning \`nemotron_v3\` + tool-calling \`utils pythonic deepseekv32 granite\`"
             echo "- parsers (HF tokenizer via HF_TOKEN + cache): reasoning \`deepseekr1 qwen3 minimax_m2\` + tool-calling \`hermes llama3_json\`"
+            echo "- bf feature layer: \`tests/bf/\` (BF-additive; GPU/download tests self-skip)"
             echo
             echo "Tier-0 of the ADR-0007 functional-test strategy. GPU-smoke (T1)"
             echo "and on-demand kernel-test (T2) tiers are tracked there."
