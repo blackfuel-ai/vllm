@@ -204,9 +204,13 @@ repos:
   - id: check-spdx-header
     name: Check SPDX headers
     entry: python tools/pre_commit/check_spdx_header.py
+    # tests/bf/ joins bf-tools/bf-docs here (not in the ruff/forbidden-imports
+    # excludes): it is BF-authored, so the vLLM provenance line this hook
+    # auto-inserts would be a false authorship claim. BF test code still
+    # follows vLLM's ruff style, so only the provenance hook is carved out.
     language: python
     types: [python]
-    exclude: '^(bf-tools|bf-docs)/'
+    exclude: '^(bf-tools|bf-docs|tests/bf)/'
   - id: check-root-lazy-imports
     name: Check root lazy imports
     entry: python tools/pre_commit/check_init_lazy_imports.py
