@@ -255,6 +255,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
+    VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942: bool = True
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1381,6 +1382,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Due to the lack of the bfloat16 asm instruction, bfloat16
     # kernels are slower than fp16,
     # If environment variable is set to 1, the input is converted to fp16
+    # Sparse-MLA decode (DeepSeek V3.2/V4 DSA) on gfx942 (MI300/MI325): run the
+    # split-K decode path tuned for gfx950 (adaptive splits sized from the real
+    # CU count) instead of the generic path. Set to 0 to keep the generic path.
+    "VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942": lambda: (
+        os.getenv("VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942", "1").lower() in ("true", "1")
+    ),
     "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": lambda: (
         os.getenv("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "True").lower()
         in ("true", "1")

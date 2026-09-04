@@ -168,6 +168,34 @@ def _launch_aiter_top_k_per_row_decode(
     )
 
 
+def _resolve_tuned_sparse_decode(
+    on_gfx942: bool, on_gfx950: bool, gfx942_tuned: bool
+) -> bool:
+    """Whether sparse-MLA decode takes the gfx950-tuned split-K path.
+
+    Native on gfx950. On gfx942 the same kernels run and the adaptive split
+    heuristic sizes work from the real CU count; ``gfx942_tuned`` carries the
+    VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942 switch. Other archs keep the generic
+    path.
+    """
+    return on_gfx950 or (on_gfx942 and gfx942_tuned)
+
+
+# Resolved once at import: gfx942 reads the switch, other archs never consult it.
+_TUNED_SPARSE_DECODE = _resolve_tuned_sparse_decode(
+    _ON_GFX942,
+    _ON_GFX950,
+    envs.VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942 if _ON_GFX942 else False,
+)
+if _ON_GFX942:
+    logger.info(
+        "Sparse-MLA decode on gfx942 uses the %s "
+        "(VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942=%d).",
+        "gfx950-tuned split-K path" if _TUNED_SPARSE_DECODE else "generic path",
+        int(_TUNED_SPARSE_DECODE),
+    )
+
+
 @triton.jit
 def _indexer_k_quant_and_cache_kernel(
     k_ptr,  # [num_tokens, head_dim]
@@ -3018,7 +3046,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         return out
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
-    if _ON_GFX950:
+    if _TUNED_SPARSE_DECODE:
         inv_q = 1.0 / max(1, num_queries)
         avg_main_len = main_indices.numel() * inv_q
         avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
@@ -3041,7 +3069,10 @@ def _rocm_sparse_attn_decode_ragged_triton(
 
     base_workgroups = num_queries * heads_blocks
     adaptive_splits = (
-        _ON_GFX950 and adaptive_splits and base_workgroups >= 16 and num_splits > 4
+        _TUNED_SPARSE_DECODE
+        and adaptive_splits
+        and base_workgroups >= 16
+        and num_splits > 4
     )
     one_wave_splits = (
         max(1, _decode_cu_count() // base_workgroups)
@@ -3059,7 +3090,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         device=q.device,
     )
 
-    if _ON_GFX950:
+    if _TUNED_SPARSE_DECODE:
         _sparse_attn_decode_gfx950_partial_kernel[
             (num_queries, num_splits, heads_blocks)
         ](
@@ -3354,7 +3385,9 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
-    direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
+    direct_out = (
+        output if _TUNED_SPARSE_DECODE and output.dtype == torch.bfloat16 else None
+    )
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,
