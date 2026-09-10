@@ -257,6 +257,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942: bool = True
     VLLM_ROCM_DSA_CANDIDATE_SELECTION: bool = True
+    VLLM_ROCM_DSA_GATHER_DEBUG: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1394,6 +1395,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # changes what the model computes and is for bisecting a fault only.
     "VLLM_ROCM_DSA_CANDIDATE_SELECTION": lambda: (
         os.getenv("VLLM_ROCM_DSA_CANDIDATE_SELECTION", "1").lower() in ("true", "1")
+    ),
+    # Log every shape and stride the ROCm indexer quant-cache gather indexes
+    # through. One line per call; for bisecting a fault in that kernel.
+    "VLLM_ROCM_DSA_GATHER_DEBUG": lambda: (
+        os.getenv("VLLM_ROCM_DSA_GATHER_DEBUG", "0").lower() in ("true", "1")
     ),
     "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": lambda: (
         os.getenv("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "True").lower()

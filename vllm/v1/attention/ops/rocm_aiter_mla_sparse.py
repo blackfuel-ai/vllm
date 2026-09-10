@@ -505,6 +505,21 @@ def cp_gather_indexer_k_quant_cache_triton(
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+    if envs.VLLM_ROCM_DSA_GATHER_DEBUG:
+        # One line per call, on the failure-prone first inference: every shape
+        # and stride the kernel indexes through, plus the block-table extremes.
+        logger.info(
+            "[dsa-gather] tokens=%d blk=%d hd=%d nblk=%d layout=%s "
+            "val(shape=%s stride0=%d numel=%d) scale(shape=%s stride0=%d) "
+            "bt(shape=%s min=%d max=%d) cu=%s t2s(min=%d max=%d)",
+            num_tokens, block_size, head_dim, num_blocks, layout,
+            tuple(k_cache_value.shape), k_cache_value.stride(0),
+            k_cache_value.numel(),
+            tuple(k_cache_scale.shape), k_cache_scale.stride(0),
+            tuple(block_table.shape), int(block_table.min()),
+            int(block_table.max()), cu_seqlen.tolist()[:8],
+            int(token_to_seq.min()), int(token_to_seq.max()),
+        )
     kernel_args = (
         k_cache_value,
         k_cache_scale,
