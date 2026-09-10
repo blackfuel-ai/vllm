@@ -256,6 +256,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_QUICK_REDUCE_MIN_SIZE_BYTES_MB: int | None = None
     VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942: bool = True
+    VLLM_ROCM_DSA_CANDIDATE_SELECTION: bool = True
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
@@ -1387,6 +1388,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CU count) instead of the generic path. Set to 0 to keep the generic path.
     "VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942": lambda: (
         os.getenv("VLLM_ROCM_SPARSE_DECODE_TUNED_GFX942", "1").lower() in ("true", "1")
+    ),
+    # Ablation switch for the ROCm two-level candidate-selection path. On by
+    # default because the V4.1 checkpoint enables the feature; turning it off
+    # changes what the model computes and is for bisecting a fault only.
+    "VLLM_ROCM_DSA_CANDIDATE_SELECTION": lambda: (
+        os.getenv("VLLM_ROCM_DSA_CANDIDATE_SELECTION", "1").lower() in ("true", "1")
     ),
     "VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": lambda: (
         os.getenv("VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", "True").lower()

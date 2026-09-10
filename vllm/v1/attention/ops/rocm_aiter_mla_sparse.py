@@ -35,6 +35,16 @@ else:
 
 logger = init_logger(__name__)
 
+# Ablation switch (see envs). Resolved once at import: the selection path is
+# part of the model's arithmetic, not a per-request choice.
+_DSA_CANDIDATE_SELECTION = envs.VLLM_ROCM_DSA_CANDIDATE_SELECTION
+if not _DSA_CANDIDATE_SELECTION:
+    logger.warning(
+        "VLLM_ROCM_DSA_CANDIDATE_SELECTION=0: two-level candidate selection is "
+        "disabled. The model computes different attention scores than the "
+        "checkpoint specifies; for fault bisection only."
+    )
+
 
 @functools.cache
 def _get_aiter_topk_ops() -> tuple[Callable[..., None], Callable[..., None]] | None:
@@ -1023,7 +1033,7 @@ def rocm_aiter_sparse_attn_indexer(
 
             num_rows = logits.shape[0]
 
-            if candidate_blocks is not None:
+            if candidate_blocks is not None and _DSA_CANDIDATE_SELECTION:
                 # Two-level selection (v4.1): the candidate source publishes
                 # its top blocks; later indexers mask their scores to them.
                 # Both before the row top-k.
@@ -1112,7 +1122,7 @@ def rocm_aiter_sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        if candidate_blocks is not None:
+        if candidate_blocks is not None and _DSA_CANDIDATE_SELECTION:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)
             # for native spec decode (per-row effective lens) and (B, 1)
