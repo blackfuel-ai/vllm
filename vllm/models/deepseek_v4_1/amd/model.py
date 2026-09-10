@@ -139,11 +139,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """Pick the ROCm sparse-MLA implementation for DeepSeek V4.1."""
     backend = vllm_config.attention_config.backend
     if backend is not None and (
-        backend is not AttentionBackendEnum.ROCM_FLASHMLA_SPARSE_DSV4
+        backend is not AttentionBackendEnum.ROCM_FLASHMLA_SPARSE_DSV41
     ):
         raise ValueError(
             f"{backend.name} is not supported for DeepSeek V4.1 on ROCm; "
-            "use ROCM_FLASHMLA_SPARSE_DSV4."
+            "use ROCM_FLASHMLA_SPARSE_DSV41."
         )
     return DeepseekV41ROCMAiterMLAAttention
 

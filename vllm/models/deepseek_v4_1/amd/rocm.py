@@ -464,7 +464,7 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
 class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
     @staticmethod
     def get_name() -> str:
-        return "ROCM_FLASHMLA_SPARSE_DSV4"
+        return "ROCM_FLASHMLA_SPARSE_DSV41"
 
     @staticmethod
     def get_builder_cls() -> type[DeepseekV4SparseMLAMetadataBuilder]:
@@ -472,6 +472,10 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
 
 
 class DeepseekV41ROCMAiterSparseSWABackend(DeepseekSparseSWABackend):
+    @staticmethod
+    def get_name() -> str:
+        return "DEEPSEEK_SPARSE_SWA_DSV41"
+
     @staticmethod
     def get_builder_cls() -> type["DeepseekV4ROCMAiterSparseSWAMetadataBuilder"]:
         return DeepseekV4ROCMAiterSparseSWAMetadataBuilder
