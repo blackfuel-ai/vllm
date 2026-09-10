@@ -397,7 +397,10 @@ def _cp_gather_indexer_quant_cache_kernel(
         )
     else:
         tiled_src_offset = offset
-    val = tl.load(src_cache_ptr + tiled_src_offset)
+    # Masked on the same predicate as the paired store below: an invalid row
+    # resolves safe_block_id to 0, but the read still issues, so the guard has
+    # to cover the load as well as the write.
+    val = tl.load(src_cache_ptr + tiled_src_offset, mask=valid_block, other=0)
     tl.store(dst_k_ptr + offset, val, mask=valid_block)
 
 
@@ -478,7 +481,10 @@ def _cp_gather_indexer_quant_cache_gfx950_kernel(
         )
     else:
         tiled_src_offset = offset
-    val = tl.load(src_cache_ptr + tiled_src_offset)
+    # Masked on the same predicate as the paired store below: an invalid row
+    # resolves safe_block_id to 0, but the read still issues, so the guard has
+    # to cover the load as well as the write.
+    val = tl.load(src_cache_ptr + tiled_src_offset, mask=valid_block, other=0)
     tl.store(dst_k_ptr + offset, val, mask=valid_block)
 
 
