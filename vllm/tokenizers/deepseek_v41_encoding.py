@@ -181,9 +181,9 @@ REASONING_EFFORT_TEMPLATE = (
     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
-    "low": 25,
-    "high": 50,
-    "xhigh": 75,
+    "low": 50,
+    "high": 75,
+    "xhigh": 88,
     "max": 100,
 }
 
