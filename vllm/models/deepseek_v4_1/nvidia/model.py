@@ -428,10 +428,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         candidate_source_layer = getattr(config, "candidate_source_layer_id", -1)
         candidate_topk_blocks = getattr(config, "candidate_topk_blocks", 0)
         if candidate_source_layer >= 0 and candidate_topk_blocks > 0:
-            self.candidate_block_buffer = torch.empty(
+            # Zeros, on the device: the two-level selection kernels index
+            # ``flags`` by the values read from this buffer, and a masking
+            # layer reads rows the source layer did not write on this step.
+            # Uninitialised values index out of bounds. It is a plain
+            # attribute rather than a registered buffer, so the loader's
+            # device-placement pass does not move it -- name the device here.
+            self.candidate_block_buffer = torch.zeros(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 candidate_topk_blocks,
                 dtype=torch.int32,
+                device=current_platform.device_type,
             )
         else:
             self.candidate_block_buffer = None
