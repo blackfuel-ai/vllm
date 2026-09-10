@@ -248,6 +248,28 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
         return [256]
 
 
+class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    """Indexer cache for DeepSeek V4.1.
+
+    Shares V4.0's packed layout -- indexer pages sit beside the MLA latent
+    pages inside each block -- so the page size must equal the one the sparse
+    MLA backend selects. V4.1's MLA advertises a narrower page than V4.0's,
+    and the V4.1 K-cache insert kernels are written against 64-token blocks
+    (``deepseek_v4_1/common/ops/cache_utils.py``), so the size is taken from
+    the MLA backend rather than restated here.
+    """
+
+    @staticmethod
+    def get_name() -> str:
+        return "DEEPSEEK_V41_INDEXER"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV4SparseMLABackend
+
+        return DeepseekV4SparseMLABackend.get_supported_kernel_block_sizes()
+
+
 @dataclass
 class DeepseekV32IndexerPrefillChunkMetadata:
     block_table: torch.Tensor
