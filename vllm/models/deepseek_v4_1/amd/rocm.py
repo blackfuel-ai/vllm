@@ -503,6 +503,87 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         self.register_buffer("_fused_compressor_weight", None, persistent=False)
         self._fused_compressor_split_sizes: tuple[int, int] | None = None
 
+        # Persistent graph buffers for the sparse-attn index tensors.
+        #
+        # combine_topk_swa_indices (prefill) and
+        # compute_global_topk_ragged_indices_and_indptr (decode) run inside
+        # the attention forward, which is captured into the breakable CUDA
+        # graph when cudagraph_runtime_mode is FULL. A cudagraph replays the
+        # kernel argument addresses recorded at capture, so an index tensor
+        # freshly allocated each call is read at its stale capture-time
+        # address on the next replay -- the HIP "Cannot get amd_mem_obj"
+        # fault. The SWA ragged path already routes through persistent
+        # buffers (decode_swa_ragged_indices_buffer); these buffers give the
+        # topk/combined paths the same stable storage.
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        max_topk = (
+            self.topk_indices_buffer.shape[-1]
+            if self.topk_indices_buffer is not None
+            else 0
+        )
+        if max_topk > 0:
+            combined_topk = (
+                (max_topk + self.window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+                // _SPARSE_PREFILL_TOPK_ALIGNMENT
+                * _SPARSE_PREFILL_TOPK_ALIGNMENT
+            )
+            device = self.topk_indices_buffer.device
+            self._prefill_combined_indices_buffer = torch.empty(
+                max_tokens * combined_topk, dtype=torch.int32, device=device
+            )
+            self._prefill_combined_lens_buffer = torch.empty(
+                max_tokens, dtype=torch.int32, device=device
+            )
+            self._decode_topk_ragged_indices_buffer = torch.empty(
+                max_tokens * max_topk, dtype=torch.int32, device=device
+            )
+            self._decode_topk_ragged_indptr_buffer = torch.empty(
+                max_tokens + 1, dtype=torch.int32, device=device
+            )
+            self._decode_topk_lens_buffer = torch.empty(
+                max_tokens, dtype=torch.int32, device=device
+            )
+        else:
+            self._prefill_combined_indices_buffer = None
+            self._prefill_combined_lens_buffer = None
+            self._decode_topk_ragged_indices_buffer = None
+            self._decode_topk_ragged_indptr_buffer = None
+            self._decode_topk_lens_buffer = None
+
+    def _persist_1d(
+        self, src: torch.Tensor, buffer: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Copy a 1-D per-call index tensor into persistent graph storage.
+
+        Returns a view over ``buffer`` holding the same values, so a captured
+        cudagraph replays against the buffer's stable base pointer rather than
+        the freshly-allocated source's address. Falls back to ``src`` when no
+        buffer is provisioned (e.g. topk disabled).
+        """
+        if buffer is None:
+            return src
+        n = src.numel()
+        out = buffer[:n]
+        out.copy_(src.reshape(-1), non_blocking=True)
+        return out.view(src.shape)
+
+    def _persist_sparse_index_tensors(
+        self,
+        indices: torch.Tensor,
+        lens: torch.Tensor,
+        indices_buffer: torch.Tensor | None,
+        lens_buffer: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Persist the prefill (indices, lens) pair, preserving 2-D shape."""
+        if indices_buffer is None or lens_buffer is None:
+            return indices, lens
+        n = indices.numel()
+        indices_out = indices_buffer[:n].view(indices.dtype).reshape(indices.shape)
+        indices_out.copy_(indices, non_blocking=True)
+        lens_out = lens_buffer[: lens.numel()]
+        lens_out.copy_(lens, non_blocking=True)
+        return indices_out, lens_out
+
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
@@ -767,6 +848,17 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 block_size,
                 is_valid,
             )
+            # Route through persistent buffers so a FULL decode graph replays
+            # against stable base pointers (see __init__).
+            topk_ragged_indices = self._persist_1d(
+                topk_ragged_indices, self._decode_topk_ragged_indices_buffer
+            )
+            topk_ragged_indptr = self._persist_1d(
+                topk_ragged_indptr, self._decode_topk_ragged_indptr_buffer
+            )
+            topk_lens = self._persist_1d(
+                topk_lens, self._decode_topk_lens_buffer
+            )
 
         rocm_sparse_attn_decode(
             q=q,
@@ -894,6 +986,12 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 top_k,
                 M,
                 N,
+            )
+            combined_indices, combined_lens = self._persist_sparse_index_tensors(
+                combined_indices,
+                combined_lens,
+                self._prefill_combined_indices_buffer,
+                self._prefill_combined_lens_buffer,
             )
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],
